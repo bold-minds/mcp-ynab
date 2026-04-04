@@ -28,6 +28,13 @@ type ynabErrorBody struct {
 // can be scrubbed before leaving the process. This is defense-in-depth: the
 // primary guarantee is that no code path in this package ever formats a raw
 // Authorization header or token into an error or log line.
+//
+// The character class is deliberately broad — base64url + "~" + "/" + "="
+// covers every common bearer-token encoding (YNAB PATs themselves are hex,
+// but nothing in this regex depends on the YNAB format). Being too strict
+// would risk missing a token from a future YNAB encoding change; being
+// broad only costs false positives on non-token strings, which is
+// harmless (we'd just over-scrub). Review finding L7.
 var bearerRe = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-~+/=]+`)
 
 // authHeaderRe matches a full Authorization header line (defense-in-depth).

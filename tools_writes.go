@@ -28,7 +28,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -287,7 +286,7 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	msg := fmt.Sprintf(
 		"Create YNAB transaction: %s on %s to %q (account %s)",
 		formatSignedMoney(in.AmountMilliunits),
-		orDefault(in.Date, time.Now().UTC().Format("2006-01-02")),
+		orDefault(in.Date, nowUTC().Format("2006-01-02")),
 		orDefault(in.PayeeName, in.PayeeID),
 		in.AccountID,
 	)
@@ -308,7 +307,7 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	}
 	date := in.Date
 	if date == "" {
-		date = time.Now().UTC().Format("2006-01-02")
+		date = nowUTC().Format("2006-01-02")
 	}
 	body := wireNewTransactionWrapper{
 		Transaction: wireNewTransaction{

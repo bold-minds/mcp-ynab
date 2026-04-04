@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -945,8 +947,22 @@ func TestStatus_HappyPath(t *testing.T) {
 	}
 
 	// Savings accounts (plural).
-	if len(out.SavingsAccounts) != 1 || out.SavingsAccounts[0].Name != "Savings" {
-		t.Errorf("wrong savings accounts: %+v", out.SavingsAccounts)
+	// LiquidAccounts includes checking AND savings from the fixture
+	// (the CC is debt, not liquid). Expected 2 liquid accounts.
+	if len(out.LiquidAccounts) != 2 {
+		t.Errorf("wrong liquid accounts count: got %d, want 2 (Checking + Savings): %+v", len(out.LiquidAccounts), out.LiquidAccounts)
+	}
+	var sawChecking, sawSavings bool
+	for _, a := range out.LiquidAccounts {
+		if a.Name == "Checking" {
+			sawChecking = true
+		}
+		if a.Name == "Savings" {
+			sawSavings = true
+		}
+	}
+	if !sawChecking || !sawSavings {
+		t.Errorf("liquid accounts should include both Checking and Savings: %+v", out.LiquidAccounts)
 	}
 
 	// Days since last reconciled: checking has a date, credit card has null.
@@ -1371,6 +1387,77 @@ func TestStatus_CreditBalanceOnDebtAccountClampsToZero(t *testing.T) {
 	// Interest should also be zero — no interest on a credit balance.
 	if out.DebtAccounts[0].MonthlyInterest != nil && out.DebtAccounts[0].MonthlyInterest.Milliunits != 0 {
 		t.Errorf("interest on credit balance should be 0, got %d", out.DebtAccounts[0].MonthlyInterest.Milliunits)
+	}
+}
+
+// TestStatus_ContextCancelledShortCircuits is the L13 regression. A
+// pre-cancelled context must cause the tool to return ctx.Err()
+// immediately without making any YNAB calls.
+func TestStatus_ContextCancelledShortCircuits(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called on a pre-cancelled context")
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the call
+	_, _, err := client.YnabStatus(ctx, nil, YnabStatusInput{PlanID: "p"})
+	if err == nil {
+		t.Fatal("expected ctx.Err() to propagate, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// TestWeeklyCheckin_ContextCancelledShortCircuits — same guard on
+// YnabWeeklyCheckin.
+func TestWeeklyCheckin_ContextCancelledShortCircuits(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called on a pre-cancelled context")
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := client.YnabWeeklyCheckin(ctx, nil, YnabWeeklyCheckinInput{PlanID: "p"})
+	if err == nil {
+		t.Fatal("expected ctx.Err() to propagate")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// TestCreateTransaction_NowUTCOverridable is the L14 regression. The
+// package-level nowUTC function can be swapped in tests so date-default
+// handlers produce deterministic output.
+func TestCreateTransaction_NowUTCOverridable(t *testing.T) {
+	// Cannot t.Parallel() because nowUTC is a package-level global.
+	t.Setenv(envAllowWrites, "1")
+	frozen := time.Date(2030, 6, 15, 12, 0, 0, 0, time.UTC)
+	nowUTC = func() time.Time { return frozen }
+	t.Cleanup(func() { nowUTC = defaultNowUTC })
+
+	var seenBody map[string]any
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&seenBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"transaction_ids":["t1"],"transaction":{"id":"t1","date":"2030-06-15","amount":-100,"cleared":"uncleared","approved":true,"account_id":"a","account_name":"C","deleted":false}}}`))
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"account":{"id":"a","name":"C","type":"checking","on_budget":true,"closed":false,"balance":0,"cleared_balance":0,"uncleared_balance":0,"deleted":false}}}`))
+		}
+	})
+	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
+		PlanID: "p", AccountID: "a", AmountMilliunits: -100, PayeeName: "Test",
+		// Date intentionally omitted to exercise the nowUTC default.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := seenBody["transaction"].(map[string]any)
+	if txn["date"] != "2030-06-15" {
+		t.Errorf("expected date from frozen nowUTC, got %v", txn["date"])
 	}
 }
 

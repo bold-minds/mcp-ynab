@@ -21,10 +21,14 @@
 //
 // Lifetime: in-memory only. The cache is tied to the process; it dies
 // when the MCP server child process exits. Nothing persists to disk.
-// No TTL, no eviction, no size cap in v0.2.0-rc.1 — for a single-session
-// MCP process this is acceptable. Future versions may add bounded
-// caches if the memory footprint becomes an issue for long-running
-// sessions.
+//
+// Memory bound (review finding L3): each per-plan entry is capped at
+// maxItemsPerPlanEntry entities. When a merge would push the count above
+// the cap, the cache flushes the entry (knowledge reset to 0) rather
+// than evicting individual items. The next read does a full refetch and
+// starts a fresh delta chain. A conservative cap (20,000) means this
+// only fires on pathological plans or very long-lived sessions and even
+// then the worst case is one extra full fetch.
 //
 // Security: the cache holds YNAB wire-entity data that was already
 // returned to the MCP tool layer. It never holds secrets, tokens, or
@@ -58,6 +62,14 @@ type deltaPlanState[T any] struct {
 	knowledge int64
 	items     map[string]T
 }
+
+// maxItemsPerPlanEntry is the per-(plan, entity-type) cache size cap.
+// At roughly 500 bytes per entity, 20,000 items per entry × two entries
+// per plan (accounts + transactions) × a small number of plans stays
+// under ~20 MB total, which is acceptable for a session-scoped MCP
+// process. When the cap fires, the affected entry is flushed and the
+// next read starts a fresh delta chain from server_knowledge=0.
+const maxItemsPerPlanEntry = 20_000
 
 // newDeltaCache constructs an empty cache.
 func newDeltaCache[T any]() *deltaCache[T] {
@@ -130,6 +142,16 @@ func (c *deltaCache[T]) merge(
 			s.items[id] = item
 		}
 	}
+
+	// Size cap: if the post-merge size would exceed the bound, flush
+	// the entire entry and fall through to returning the deltas as-is.
+	// Next call resets knowledge to 0 and does a full refetch, starting
+	// a fresh delta chain. Review finding L3.
+	if len(s.items) > maxItemsPerPlanEntry {
+		delete(c.plans, planID)
+		return deltas
+	}
+
 	s.knowledge = newKnowledge
 
 	// Return the full merged set as a slice. Order is not preserved

@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ## [Unreleased]
 
+### Changed (breaking, v0.2.0-rc.2 vs v0.2.0-rc.1)
+
+- `ynab_status.savings_accounts` renamed to `ynab_status.liquid_accounts`, and the field now includes `checking` and `cash` account types alongside `savings`. The previous field only surfaced savings-type accounts, which missed users whose Ready-to-Assign cushion lives on a checking balance. Review finding L5.
+
+### Fixed (v0.2.0-rc.1 code review)
+
+High-severity (silent correctness bugs):
+- **H1**: Task tools no longer inherit `ListTransactions`'s 500-row LLM-context trim. New `fetchTransactionsForAggregation` with a 50,000-row safety ceiling is used by `ynab_spending_check`, `ynab_weekly_checkin`, and `ynab_status`. `YnabSpendingCheckOutput.OnPlan` is now `*bool` and absent when `Truncated=true`, replaced by `VerdictUnavailableReason`.
+- **H2**: `ynab_weekly_checkin` no longer double-counts transfers between on-budget accounts in its `income_received` and `total_outflows` sums. `Transaction.TransferAccountID` is now plumbed through from YNAB's wire field; transfer rows are filtered out at the aggregation boundary.
+- **H3**: `ynab_status.unapproved_transaction_count` deduplicates transfer mirror rows via `countUnapprovedExcludingTransferMirrors`. An unapproved transfer now counts as 1 pending item, not 2.
+
+Medium-severity:
+- **M1**: `elicitConfirmation` distinguishes `context.Canceled` / `context.DeadlineExceeded` (abort) from other elicit errors (graceful-degrade as unsupported-client).
+- **M2**: `update_transaction` elicitation message renders new category/payee UUIDs as `(new id=...)` instead of next to a name, making the name-vs-id asymmetry explicit.
+- **M5**: `loadToken` `YNAB_API_TOKEN_FILE` reads are bounded at 4 KB via `io.LimitReader`.
+
+Low-severity:
+- **B2**: `simulateAvalanche` payoff-order tiebreak now compares APR (the code's intent) instead of `BalanceAtStart` (what it actually did). `DebtPayoffMilestone.APRPercent` surfaced in output.
+- **B3/M3**: `Month.AgeOfMoney` and `MonthSummary.AgeOfMoney` changed from `int` to `*int` to preserve the null-vs-zero distinction. `ynab_weekly_checkin.age_of_money_delta_days` now correctly reports a delta of 0 for new plans where `age_of_money=0` legitimately.
+- **B4**: `ynab_status` clamps debt account balances to zero when the user has a credit balance, matching `ynab_debt_snapshot`'s existing behavior.
+- **L2**: Refused redirects log their target URL to stderr for operator debugging (the error returned to MCP clients is still status-only).
+- **L3**: `deltaCache` enforces a per-plan-entry cap of 20,000 items. When hit, the entry is flushed and the next call resets to a fresh delta chain.
+- **L4**: `progressedThisMonth` → `anyProgressFromInitial` (misleading name).
+- **L5**: `ynab_status.savings_accounts` → `liquid_accounts` (see Changed above).
+- **L6**: `debtAccountTypes` lifted from inline literal to package-level `var`.
+- **L9**: `YnabDebtSnapshot.extra_per_month_milliunits` sanity-capped at 1 billion milliunits ($1M USD/month).
+- **L14**: Introduced `clock.go` with an overridable package-level `nowUTC` function. All production time-dependent paths route through it; tests override for determinism via `t.Cleanup`.
+
+Plus a handful of documentation clarifications: M4 (floor-division error magnitude), M6 (cross-category de-dup rationale), M7 (spec-verified `type + scope` combination), L1 (per-Client vs per-token rate limiter wording), L7 (`bearerRe` allowlist rationale), L8 (`list_categories` slice pre-sizing), L10 (month format string style), L11 (`IsSubtransaction` omitempty behavior), L12 (`CreateTransactionOutput.Before *struct{}` rationale), L13 (explicit `ctx.Err()` short-circuit in long task tools).
+
 ## [0.2.0] — 2026-04-04
 
 Major feature release. Adds write tools (opt-in), 5 task-shaped tools,

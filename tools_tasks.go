@@ -237,7 +237,7 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 
 	out := YnabDebtSnapshotOutput{
-		AsOfDate:             time.Now().UTC().Format("2006-01-02"),
+		AsOfDate:             nowUTC().Format("2006-01-02"),
 		TotalBalance:         NewMoney(totalBalanceMu),
 		TotalMonthlyInterest: NewMoney(totalInterestMu),
 		AnnualInterestCost:   NewMoney(totalInterestMu * 12),
@@ -450,7 +450,7 @@ func simulateAvalanche(
 		return payoffMilestones[i].APRPercent > payoffMilestones[j].APRPercent
 	})
 
-	debtFreeDate := time.Now().UTC().AddDate(0, month, 0).Format("2006-01")
+	debtFreeDate := nowUTC().AddDate(0, month, 0).Format("2006-01")
 	return DebtPayoffProjection{
 		MonthsToDebtFree: month,
 		TotalInterest:    NewMoney(totalInterest),
@@ -594,16 +594,31 @@ type YnabStatusOutput struct {
 	// categories were filtered out of overspent_categories because they
 	// are auto-managed credit card payment categories. Allows honest
 	// reporting per the Q3 decision in the v0.2 brief.
-	CreditCardPaymentCategoriesExcludedCount int                            `json:"credit_card_payment_categories_excluded_count"`
-	DebtAccounts                             []DebtStatusEntry              `json:"debt_accounts"`
-	SavingsAccounts                          []Account                      `json:"savings_accounts"`
-	DaysSinceLastReconciled                  []DaysSinceLastReconciledEntry `json:"days_since_last_reconciled"`
-	UnapprovedTransactionCount               int                            `json:"unapproved_transaction_count"`
-	ScheduledNext7Days                       ScheduledNext7Days             `json:"scheduled_next_7_days"`
+	CreditCardPaymentCategoriesExcludedCount int               `json:"credit_card_payment_categories_excluded_count"`
+	DebtAccounts                             []DebtStatusEntry `json:"debt_accounts"`
+	// LiquidAccounts covers all on-budget asset account types — YNAB's
+	// checking, savings, and cash — so a user whose Ready-to-Assign
+	// cushion lives in their checking account still sees it reflected
+	// on the Sunday dashboard. Replaces v0.2.0-rc.1's savings_accounts
+	// field which only surfaced the "savings" type. Review finding L5.
+	LiquidAccounts             []Account                      `json:"liquid_accounts" jsonschema:"checking + savings + cash accounts (YNAB's on-budget asset types); excludes debt accounts and otherAsset (ambiguous)"`
+	DaysSinceLastReconciled    []DaysSinceLastReconciledEntry `json:"days_since_last_reconciled"`
+	UnapprovedTransactionCount int                            `json:"unapproved_transaction_count"`
+	ScheduledNext7Days         ScheduledNext7Days             `json:"scheduled_next_7_days"`
 	// Truncated is true when the unapproved-transaction count exceeded
 	// the internal aggregation safety ceiling. The count in that case is
 	// a lower bound.
 	Truncated bool `json:"truncated,omitempty" jsonschema:"true when unapproved_transaction_count hit the internal 50000-row safety ceiling; the count is a lower bound in that case"`
+}
+
+// liquidAccountTypes is the set of YNAB account types considered
+// "liquid" — immediately spendable or transferable without a sale or
+// transfer-out. Excludes investment-like types (otherAsset is
+// ambiguous) and all debt types.
+var liquidAccountTypes = map[string]bool{
+	"checking": true,
+	"savings":  true,
+	"cash":     true,
 }
 
 // YnabStatus returns a Sunday-ritual dashboard in one call, composing
@@ -612,6 +627,12 @@ type YnabStatusOutput struct {
 func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in YnabStatusInput) (*mcp.CallToolResult, YnabStatusOutput, error) {
 	if in.PlanID == "" {
 		return nil, YnabStatusOutput{}, errors.New("plan_id is required")
+	}
+	// Check for caller cancellation up-front. Each sub-call's httpClient.Do
+	// also respects ctx, but an already-cancelled ctx should short-circuit
+	// here before any map lookups or local setup. Review finding L13.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabStatusOutput{}, err
 	}
 
 	// 1. Current month for ready_to_assign.
@@ -692,7 +713,7 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 		debtCfgByID[cfg.AccountID] = cfg
 	}
 
-	// Accounts pass: classify debt and savings.
+	// Accounts pass: classify debt and liquid.
 	for _, a := range accOut.Accounts {
 		if debtAccountTypes[a.Type] {
 			// YNAB stores debt as negative milliunits (owed). Flip sign
@@ -728,8 +749,8 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 			}
 			out.DebtAccounts = append(out.DebtAccounts, entry)
 		}
-		if a.Type == "savings" {
-			out.SavingsAccounts = append(out.SavingsAccounts, a)
+		if liquidAccountTypes[a.Type] {
+			out.LiquidAccounts = append(out.LiquidAccounts, a)
 		}
 	}
 
@@ -741,7 +762,7 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// For now, compute via a fresh list_accounts call that we re-parse
 	// via a direct doJSON path. Simpler: extend the Account output type
 	// to include last_reconciled_at (done in this commit).
-	today := time.Now().UTC()
+	today := nowUTC()
 	for _, a := range accOut.Accounts {
 		entry := DaysSinceLastReconciledEntry{
 			AccountID: a.ID,
@@ -857,8 +878,12 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 	if in.PlanID == "" {
 		return nil, YnabWeeklyCheckinOutput{}, errors.New("plan_id is required")
 	}
+	// Check for caller cancellation up-front. Review finding L13.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, err
+	}
 
-	asOf := time.Now().UTC()
+	asOf := nowUTC()
 	if in.AsOfDate != "" {
 		parsed, err := time.Parse("2006-01-02", in.AsOfDate)
 		if err != nil {
@@ -964,15 +989,13 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 	out.UnapprovedCount = countUnapprovedExcludingTransferMirrors(unapprovedRows)
 
 	// Month-over-month newly-overspent comparison. Fetch current and
-	// prior month, compare category balance signs.
-	// YNAB months are always the first of the month in ISO format
-	// (YYYY-MM-01). Build explicitly via fmt because "2006-01-01" as a
-	// Go time format would be ambiguous (01 is the month reference).
-	y, m, _ := asOf.Date()
-	currentMonthDate := fmt.Sprintf("%04d-%02d-01", y, int(m))
-	prior := asOf.AddDate(0, -1, 0)
-	py, pm, _ := prior.Date()
-	priorMonthDate := fmt.Sprintf("%04d-%02d-01", py, int(pm))
+	// prior month, compare category balance signs. YNAB months are
+	// always the first of the month in ISO format (YYYY-MM-01); compose
+	// via "2006-01" + "-01" — the plain concat is cleaner than
+	// fmt.Sprintf and correct because Go's time format "2006-01" is
+	// unambiguously year-month. Review finding L10.
+	currentMonthDate := asOf.Format("2006-01") + "-01"
+	priorMonthDate := asOf.AddDate(0, -1, 0).Format("2006-01") + "-01"
 
 	_, curMonthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: currentMonthDate})
 	if err != nil {

@@ -124,6 +124,53 @@ func TestDeltaCache_EmptyIDEntitiesSkipped(t *testing.T) {
 	}
 }
 
+// TestDeltaCache_SizeCapFlushesEntry is the L3 regression. When a merge
+// would push the per-plan entity count above maxItemsPerPlanEntry, the
+// cache flushes the entry entirely and returns the raw deltas. The next
+// call then starts from knowledge=0 with a fresh state.
+func TestDeltaCache_SizeCapFlushesEntry(t *testing.T) {
+	t.Parallel()
+	c := newDeltaCache[testEntity]()
+	// Build one merge call with maxItemsPerPlanEntry + 1 unique items.
+	// The merge should flush the entry.
+	n := maxItemsPerPlanEntry + 1
+	items := make([]testEntity, n)
+	for i := 0; i < n; i++ {
+		items[i] = testEntity{ID: "e" + itoa(int64(i)), Name: "x"}
+	}
+	out := c.merge("plan-big", 500, items, testID, testDeleted)
+
+	// merge should have returned the raw deltas (passthrough after flush).
+	if len(out) != n {
+		t.Errorf("expected %d raw deltas returned on cap-triggered flush, got %d", n, len(out))
+	}
+	// After the flush, the cache should NOT hold this plan anymore.
+	if c.knowledge("plan-big") != 0 {
+		t.Errorf("expected cache knowledge reset to 0 after flush, got %d", c.knowledge("plan-big"))
+	}
+	if c.size("plan-big") != 0 {
+		t.Errorf("expected empty cache after flush, got size %d", c.size("plan-big"))
+	}
+}
+
+func TestDeltaCache_BelowCapDoesNotFlush(t *testing.T) {
+	t.Parallel()
+	c := newDeltaCache[testEntity]()
+	// Exactly at the cap should NOT flush.
+	n := maxItemsPerPlanEntry
+	items := make([]testEntity, n)
+	for i := 0; i < n; i++ {
+		items[i] = testEntity{ID: "e" + itoa(int64(i)), Name: "x"}
+	}
+	_ = c.merge("plan-max", 100, items, testID, testDeleted)
+	if c.size("plan-max") != n {
+		t.Errorf("expected size %d at cap, got %d (should not flush at exactly the cap)", n, c.size("plan-max"))
+	}
+	if c.knowledge("plan-max") != 100 {
+		t.Errorf("expected knowledge preserved when not flushed, got %d", c.knowledge("plan-max"))
+	}
+}
+
 func TestDeltaCache_ConcurrentMergeAndRead(t *testing.T) {
 	t.Parallel()
 	c := newDeltaCache[testEntity]()

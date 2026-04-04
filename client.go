@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -206,7 +207,18 @@ func NewClient(token Token) (*Client, error) {
 			// Refuse all redirects. The YNAB v1 API does not redirect; if
 			// it ever starts, we fail loud rather than silently forward
 			// the Authorization header across hosts.
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			//
+			// When a redirect is refused, log the target URL to stderr
+			// (our standard logger is redirected to stderr in main.go)
+			// so an operator diagnosing "why is YNAB returning 3xx" has
+			// the location. The URL is safe to log — our code never puts
+			// secrets in URLs, so req.URL contains no tokens. The error
+			// returned to the MCP client remains status-only via
+			// apiError. Review finding L2.
+			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				if req != nil && req.URL != nil {
+					log.Printf("ynab: refused redirect to %q (all redirects blocked to prevent Authorization forwarding)", req.URL.String())
+				}
 				return http.ErrUseLastResponse
 			},
 		},

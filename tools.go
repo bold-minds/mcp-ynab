@@ -24,7 +24,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -463,7 +462,7 @@ func (c *Client) ListScheduledTransactions(ctx context.Context, _ *mcp.CallToolR
 	// correctly as a string.
 	var cutoff string
 	if in.UpcomingDays > 0 {
-		cutoff = time.Now().UTC().AddDate(0, 0, in.UpcomingDays).Format("2006-01-02")
+		cutoff = nowUTC().AddDate(0, 0, in.UpcomingDays).Format("2006-01-02")
 	}
 	out := ListScheduledTransactionsOutput{
 		ScheduledTransactions: make([]ScheduledTransaction, 0),
@@ -516,7 +515,13 @@ func (c *Client) ListCategories(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if err := c.doJSON(ctx, path, nil, &wire); err != nil {
 		return nil, ListCategoriesOutput{}, sanitizedErr(err)
 	}
-	categories := make([]Category, 0)
+	// Pre-size the slice based on a conservative sum across groups.
+	// Review finding L8.
+	total := 0
+	for _, g := range wire.Data.CategoryGroups {
+		total += len(g.Categories)
+	}
+	categories := make([]Category, 0, total)
 	for _, g := range wire.Data.CategoryGroups {
 		if g.Deleted {
 			continue
