@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ynabDebtAccountsResponse is a helper that builds an httptest handler
@@ -787,6 +788,158 @@ func TestWaterfall_InputValidation(t *testing.T) {
 				t.Errorf("expected error containing %q, got %v", c.want, err)
 			}
 		})
+	}
+}
+
+// ---- ynab_status -----------------------------------------------------------
+
+// statusHandler routes requests to different endpoints and returns
+// canned responses for a ynab_status integration test.
+func statusHandler(withDebtConfig bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/months/current"):
+			_, _ = w.Write([]byte(`{"data":{"month":{
+				"month":"2026-04-01","income":5000000,"budgeted":2500000,"activity":-800000,"to_be_budgeted":1500000,"age_of_money":45,"categories":[]
+			}}}`))
+		case strings.HasSuffix(p, "/accounts"):
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"accounts":[
+				{"id":"acct-check","name":"Checking","type":"checking","on_budget":true,"closed":false,"balance":2000000,"cleared_balance":2000000,"uncleared_balance":0,"last_reconciled_at":"2026-04-01T00:00:00Z","deleted":false},
+				{"id":"acct-savings","name":"Savings","type":"savings","on_budget":true,"closed":false,"balance":10000000,"cleared_balance":10000000,"uncleared_balance":0,"last_reconciled_at":"2026-03-20T00:00:00Z","deleted":false},
+				{"id":"acct-cc","name":"Visa","type":"creditCard","on_budget":true,"closed":false,"balance":-1500000,"cleared_balance":-1500000,"uncleared_balance":0,"last_reconciled_at":null,"deleted":false}
+			]}}`))
+		case strings.HasSuffix(p, "/categories"):
+			_, _ = w.Write([]byte(`{"data":{"category_groups":[
+				{"id":"g-immediate","name":"Immediate","hidden":false,"deleted":false,"categories":[
+					{"id":"cat-rent","category_group_id":"g-immediate","category_group_name":"Immediate","name":"Rent","budgeted":1500000,"activity":-1500000,"balance":0,"deleted":false},
+					{"id":"cat-groc","category_group_id":"g-immediate","category_group_name":"Immediate","name":"Groceries","budgeted":400000,"activity":-450000,"balance":-50000,"deleted":false}
+				]},
+				{"id":"g-ccp","name":"Credit Card Payments","hidden":false,"deleted":false,"categories":[
+					{"id":"cat-visa","category_group_id":"g-ccp","category_group_name":"Credit Card Payments","name":"Visa","budgeted":0,"activity":-200000,"balance":-200000,"deleted":false}
+				]}
+			]}}`))
+		case strings.Contains(p, "/transactions"):
+			// type=unapproved query param present
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[
+				{"id":"t1","date":"2026-04-05","amount":-5000,"cleared":"uncleared","approved":false,"account_id":"acct-check","account_name":"Checking","deleted":false},
+				{"id":"t2","date":"2026-04-06","amount":-3000,"cleared":"uncleared","approved":false,"account_id":"acct-check","account_name":"Checking","deleted":false}
+			]}}`))
+		case strings.HasSuffix(p, "/scheduled_transactions"):
+			// A monthly rent scheduled for tomorrow + a weekly schedule
+			// for 2 days from now.
+			tomorrow := time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02")
+			inTwoDays := time.Now().UTC().AddDate(0, 0, 2).Format("2006-01-02")
+			body := `{"data":{"scheduled_transactions":[
+				{"id":"s-rent","date_first":"2026-01-01","date_next":"` + tomorrow + `","frequency":"monthly","amount":-1500000,"account_id":"acct-check","account_name":"Checking","payee_name":"Landlord","deleted":false},
+				{"id":"s-weekly","date_first":"2026-01-01","date_next":"` + inTwoDays + `","frequency":"weekly","amount":-50000,"account_id":"acct-check","account_name":"Checking","payee_name":"Subscription","deleted":false}
+			]}}`
+			_, _ = w.Write([]byte(body))
+		default:
+			http.Error(w, "unexpected URL: "+p, http.StatusNotFound)
+		}
+	}
+}
+
+func TestStatus_HappyPath(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, statusHandler(false))
+	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{
+		PlanID: "plan-1",
+		DebtAccountConfig: []DebtAccountConfig{
+			{AccountID: "acct-cc", Nickname: "My Visa", APRPercent: 24, MinimumPaymentMilliunits: 50000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ready to Assign
+	if out.ReadyToAssign.Milliunits != 1500000 {
+		t.Errorf("wrong ready_to_assign: %d", out.ReadyToAssign.Milliunits)
+	}
+
+	// Overspent categories: Groceries (-$50), Credit Card Payments
+	// "Visa" (-$200) should be EXCLUDED.
+	if len(out.OverspentCategories) != 1 {
+		t.Fatalf("expected 1 overspent category (Groceries), got %d: %+v", len(out.OverspentCategories), out.OverspentCategories)
+	}
+	if out.OverspentCategories[0].Name != "Groceries" {
+		t.Errorf("wrong overspent category: %+v", out.OverspentCategories[0])
+	}
+	if out.OverspentCategories[0].Overspend.Milliunits != 50000 {
+		t.Errorf("wrong overspend amount: %d", out.OverspentCategories[0].Overspend.Milliunits)
+	}
+	if out.CreditCardPaymentCategoriesExcludedCount != 1 {
+		t.Errorf("expected 1 CC payment category excluded, got %d", out.CreditCardPaymentCategoriesExcludedCount)
+	}
+
+	// Debt accounts with APR enrichment.
+	if len(out.DebtAccounts) != 1 {
+		t.Fatalf("expected 1 debt account, got %d", len(out.DebtAccounts))
+	}
+	d := out.DebtAccounts[0]
+	if d.Nickname != "My Visa" {
+		t.Errorf("nickname should come from config: %s", d.Nickname)
+	}
+	if d.Balance.Milliunits != 1500000 {
+		t.Errorf("debt balance should be positive (amount owed): %d", d.Balance.Milliunits)
+	}
+	if d.APRPercent == nil || *d.APRPercent != 24 {
+		t.Errorf("APR should be populated from config: %v", d.APRPercent)
+	}
+	if d.MonthlyInterest == nil {
+		t.Error("monthly interest should be computed")
+	}
+
+	// Savings accounts (plural).
+	if len(out.SavingsAccounts) != 1 || out.SavingsAccounts[0].Name != "Savings" {
+		t.Errorf("wrong savings accounts: %+v", out.SavingsAccounts)
+	}
+
+	// Days since last reconciled: checking has a date, credit card has null.
+	var daysForCC *int
+	var daysForChecking *int
+	for _, e := range out.DaysSinceLastReconciled {
+		switch e.AccountID {
+		case "acct-cc":
+			daysForCC = e.Days
+		case "acct-check":
+			daysForChecking = e.Days
+		}
+	}
+	if daysForCC != nil {
+		t.Errorf("CC should have null days (never reconciled), got %v", *daysForCC)
+	}
+	if daysForChecking == nil {
+		t.Error("checking should have days populated")
+	}
+
+	// Unapproved count.
+	if out.UnapprovedTransactionCount != 2 {
+		t.Errorf("expected 2 unapproved, got %d", out.UnapprovedTransactionCount)
+	}
+
+	// Scheduled next 7 days: the monthly rent fires once (tomorrow),
+	// the weekly fires once (in 2 days). Total outflow = 1500000 + 50000.
+	if len(out.ScheduledNext7Days.Occurrences) != 2 {
+		t.Errorf("expected 2 occurrences, got %d: %+v", len(out.ScheduledNext7Days.Occurrences), out.ScheduledNext7Days.Occurrences)
+	}
+	expectedTotalOutflow := int64(1500000 + 50000)
+	if out.ScheduledNext7Days.TotalOutflow.Milliunits != expectedTotalOutflow {
+		t.Errorf("wrong total outflow: got %d, want %d", out.ScheduledNext7Days.TotalOutflow.Milliunits, expectedTotalOutflow)
+	}
+}
+
+func TestStatus_RequiresPlanID(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called")
+	})
+	_, _, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{})
+	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+		t.Errorf("wrong error: %v", err)
 	}
 }
 

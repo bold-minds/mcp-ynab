@@ -446,6 +446,274 @@ func progressedThisMonth(current, initial []int64) bool {
 }
 
 // ============================================================================
+// ynab_status — one-call dashboard snapshot for the Sunday ritual
+// ============================================================================
+
+// ynabStatusCreditCardPaymentGroupName is the hard-coded English name
+// YNAB assigns to the auto-managed category group that holds credit
+// card payment categories. YNAB's API does not expose a machine-readable
+// "is credit card payment group" flag, so we match on this literal.
+//
+// See docs/ASSUMPTIONS.md — YNAB's API has been English-only for 15+
+// years and this name has not changed, so the pragmatic choice is a
+// string match with a documented assumption. If YNAB ever localizes,
+// this is the single place to update.
+const ynabStatusCreditCardPaymentGroupName = "Credit Card Payments"
+
+// YnabStatusInput takes the debt account config as an optional argument
+// so the status view can display APR and monthly interest for debt
+// accounts when the skill has that data. If the config is omitted, debt
+// accounts still appear in the list but without APR/interest fields.
+type YnabStatusInput struct {
+	PlanID            string              `json:"plan_id" jsonschema:"YNAB plan id, or 'last-used' / 'default'"`
+	DebtAccountConfig []DebtAccountConfig `json:"debt_account_config,omitempty" jsonschema:"optional: debt accounts to enrich with APR and monthly interest. If omitted, debt accounts appear without APR/interest fields."`
+}
+
+// DebtStatusEntry is a debt account in the status output. APR and
+// monthly interest are nullable — null when the caller did not supply
+// debt_account_config.
+type DebtStatusEntry struct {
+	AccountID       string   `json:"account_id"`
+	Nickname        string   `json:"nickname"`
+	Balance         Money    `json:"balance"`
+	APRPercent      *float64 `json:"apr_percent,omitempty"`
+	MonthlyInterest *Money   `json:"monthly_interest,omitempty"`
+	MinimumPayment  *Money   `json:"minimum_payment,omitempty"`
+}
+
+// OverspentCategoryEntry is a category with a negative balance, excluded
+// credit card payment categories (per the Q3 decision in the v0.2 brief).
+type OverspentCategoryEntry struct {
+	CategoryID string `json:"category_id"`
+	Name       string `json:"name"`
+	GroupName  string `json:"group_name"`
+	Overspend  Money  `json:"overspend" jsonschema:"positive milliunits, the absolute value of the negative balance"`
+}
+
+// DaysSinceLastReconciledEntry is one account's "how long since the user
+// reconciled this account" datapoint. Null days means the account has
+// never been reconciled.
+type DaysSinceLastReconciledEntry struct {
+	AccountID string `json:"account_id"`
+	Name      string `json:"name"`
+	Days      *int   `json:"days,omitempty" jsonschema:"days since last_reconciled_at; null if the account has never been reconciled"`
+}
+
+// ScheduledOutflowOccurrence is one expanded scheduled-transaction
+// occurrence within the next-7-days window.
+type ScheduledOutflowOccurrence struct {
+	ScheduledID string `json:"scheduled_id"`
+	PayeeName   string `json:"payee_name,omitempty"`
+	Date        string `json:"date" jsonschema:"YYYY-MM-DD of this specific occurrence"`
+	Amount      Money  `json:"amount" jsonschema:"signed amount; negative for outflows"`
+}
+
+// ScheduledNext7Days is the aggregated next-7-days scheduled transaction
+// view, expanded via the recurrence iterator so daily and weekly schedules
+// are correctly counted multiple times.
+type ScheduledNext7Days struct {
+	TotalOutflow Money                        `json:"total_outflow" jsonschema:"sum of the absolute values of negative occurrences (money going out)"`
+	TotalInflow  Money                        `json:"total_inflow" jsonschema:"sum of positive occurrences (money coming in)"`
+	Occurrences  []ScheduledOutflowOccurrence `json:"occurrences"`
+}
+
+// YnabStatusOutput is the dashboard response.
+type YnabStatusOutput struct {
+	ReadyToAssign Money                          `json:"ready_to_assign" jsonschema:"current plan's to_be_budgeted amount"`
+	OverspentCategories []OverspentCategoryEntry `json:"overspent_categories"`
+	// CreditCardPaymentCategoriesExcludedCount tells the LLM whether any
+	// categories were filtered out of overspent_categories because they
+	// are auto-managed credit card payment categories. Allows honest
+	// reporting per the Q3 decision in the v0.2 brief.
+	CreditCardPaymentCategoriesExcludedCount int `json:"credit_card_payment_categories_excluded_count"`
+	DebtAccounts              []DebtStatusEntry             `json:"debt_accounts"`
+	SavingsAccounts           []Account                     `json:"savings_accounts"`
+	DaysSinceLastReconciled   []DaysSinceLastReconciledEntry `json:"days_since_last_reconciled"`
+	UnapprovedTransactionCount int                          `json:"unapproved_transaction_count"`
+	ScheduledNext7Days        ScheduledNext7Days             `json:"scheduled_next_7_days"`
+}
+
+// YnabStatus returns a Sunday-ritual dashboard in one call, composing
+// list_accounts + list_categories + list_transactions(type=unapproved) +
+// list_scheduled_transactions + get_month(current).
+func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in YnabStatusInput) (*mcp.CallToolResult, YnabStatusOutput, error) {
+	if in.PlanID == "" {
+		return nil, YnabStatusOutput{}, errors.New("plan_id is required")
+	}
+
+	// 1. Current month for ready_to_assign.
+	_, monthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: "current"})
+	if err != nil {
+		return nil, YnabStatusOutput{}, sanitizedErr(err)
+	}
+
+	// 2. Accounts — for debt balances, savings_accounts, and
+	//    days_since_last_reconciled. Use list_accounts with include_closed
+	//    off (we only care about live accounts).
+	_, accOut, err := c.ListAccounts(ctx, nil, ListAccountsInput{PlanID: in.PlanID, IncludeClosed: false})
+	if err != nil {
+		return nil, YnabStatusOutput{}, sanitizedErr(err)
+	}
+
+	// 3. Categories for overspent detection. list_categories already
+	//    includes group_name on each category.
+	_, catOut, err := c.ListCategories(ctx, nil, ListCategoriesInput{PlanID: in.PlanID})
+	if err != nil {
+		return nil, YnabStatusOutput{}, sanitizedErr(err)
+	}
+
+	// 4. Unapproved transaction count.
+	_, unapprovedOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
+		PlanID: in.PlanID,
+		Type:   "unapproved",
+		Limit:  500,
+	})
+	if err != nil {
+		return nil, YnabStatusOutput{}, sanitizedErr(err)
+	}
+
+	// 5. Scheduled transactions for next 7 days window.
+	_, schedOut, err := c.ListScheduledTransactions(ctx, nil, ListScheduledTransactionsInput{
+		PlanID: in.PlanID,
+	})
+	if err != nil {
+		return nil, YnabStatusOutput{}, sanitizedErr(err)
+	}
+
+	// Compose the output from the fetched data.
+	out := YnabStatusOutput{
+		ReadyToAssign:              monthOut.ToBeBudgeted,
+		UnapprovedTransactionCount: len(unapprovedOut.Transactions),
+	}
+
+	// Overspent categories: balance < 0 AND not in the Credit Card
+	// Payments auto-managed group. See docs/ASSUMPTIONS.md for the
+	// English-name match rationale.
+	var ccExcluded int
+	for _, cat := range catOut.Categories {
+		if cat.Balance.Milliunits >= 0 {
+			continue
+		}
+		if cat.GroupName == ynabStatusCreditCardPaymentGroupName {
+			ccExcluded++
+			continue
+		}
+		out.OverspentCategories = append(out.OverspentCategories, OverspentCategoryEntry{
+			CategoryID: cat.ID,
+			Name:       cat.Name,
+			GroupName:  cat.GroupName,
+			Overspend:  NewMoney(-cat.Balance.Milliunits),
+		})
+	}
+	out.CreditCardPaymentCategoriesExcludedCount = ccExcluded
+
+	// Debt accounts: YNAB's debt account types per the spec.
+	debtTypes := map[string]bool{
+		"creditCard":     true,
+		"lineOfCredit":   true,
+		"mortgage":       true,
+		"autoLoan":       true,
+		"studentLoan":    true,
+		"personalLoan":   true,
+		"medicalDebt":    true,
+		"otherDebt":      true,
+	}
+	debtCfgByID := make(map[string]DebtAccountConfig, len(in.DebtAccountConfig))
+	for _, cfg := range in.DebtAccountConfig {
+		debtCfgByID[cfg.AccountID] = cfg
+	}
+
+	// Savings accounts.
+	for _, a := range accOut.Accounts {
+		if debtTypes[a.Type] {
+			entry := DebtStatusEntry{
+				AccountID: a.ID,
+				Nickname:  a.Name,
+				// Debt accounts have negative balances; flip sign for
+				// display (positive = amount owed).
+				Balance: NewMoney(-a.Balance.Milliunits),
+			}
+			if cfg, ok := debtCfgByID[a.ID]; ok {
+				if cfg.Nickname != "" {
+					entry.Nickname = cfg.Nickname
+				}
+				aprCopy := cfg.APRPercent
+				entry.APRPercent = &aprCopy
+				minCopy := NewMoney(cfg.MinimumPaymentMilliunits)
+				entry.MinimumPayment = &minCopy
+				interest := monthlyInterestMilliunits(-a.Balance.Milliunits, aprToBasisPoints(cfg.APRPercent))
+				if interest < 0 {
+					interest = 0
+				}
+				interestMoney := NewMoney(interest)
+				entry.MonthlyInterest = &interestMoney
+			}
+			out.DebtAccounts = append(out.DebtAccounts, entry)
+		}
+		if a.Type == "savings" {
+			out.SavingsAccounts = append(out.SavingsAccounts, a)
+		}
+	}
+
+	// Days since last reconciled. list_accounts uses the output Account
+	// type which doesn't include last_reconciled_at — need to read it
+	// from the wire via a second call or extend Account. Extend Account
+	// to carry the field.
+	//
+	// For now, compute via a fresh list_accounts call that we re-parse
+	// via a direct doJSON path. Simpler: extend the Account output type
+	// to include last_reconciled_at (done in this commit).
+	today := time.Now().UTC()
+	for _, a := range accOut.Accounts {
+		entry := DaysSinceLastReconciledEntry{
+			AccountID: a.ID,
+			Name:      a.Name,
+		}
+		if a.LastReconciledAt != nil {
+			days := int(today.Sub(*a.LastReconciledAt).Hours() / 24)
+			if days < 0 {
+				days = 0
+			}
+			entry.Days = &days
+		}
+		out.DaysSinceLastReconciled = append(out.DaysSinceLastReconciled, entry)
+	}
+
+	// Scheduled next 7 days: expand recurrences via the iterator.
+	windowStart := dateOnly(today)
+	windowEnd := windowStart.AddDate(0, 0, 7)
+	var totalOutflowMu, totalInflowMu int64
+	for _, s := range schedOut.ScheduledTransactions {
+		parsedDate, err := time.Parse("2006-01-02", s.DateNext)
+		if err != nil {
+			continue // skip malformed date
+		}
+		occurrences := FrequencyOccurrences(parsedDate, s.Frequency, windowStart, windowEnd)
+		for _, occ := range occurrences {
+			if s.Amount.Milliunits < 0 {
+				totalOutflowMu += -s.Amount.Milliunits
+			} else {
+				totalInflowMu += s.Amount.Milliunits
+			}
+			out.ScheduledNext7Days.Occurrences = append(out.ScheduledNext7Days.Occurrences, ScheduledOutflowOccurrence{
+				ScheduledID: s.ID,
+				PayeeName:   s.PayeeName,
+				Date:        occ.Format("2006-01-02"),
+				Amount:      s.Amount,
+			})
+		}
+	}
+	out.ScheduledNext7Days.TotalOutflow = NewMoney(totalOutflowMu)
+	out.ScheduledNext7Days.TotalInflow = NewMoney(totalInflowMu)
+	// Sort occurrences by date ascending for predictable output.
+	sort.Slice(out.ScheduledNext7Days.Occurrences, func(i, j int) bool {
+		return out.ScheduledNext7Days.Occurrences[i].Date < out.ScheduledNext7Days.Occurrences[j].Date
+	})
+
+	return nil, out, nil
+}
+
+// ============================================================================
 // ynab_spending_check — did the user stay on plan in a date range?
 // ============================================================================
 

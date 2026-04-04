@@ -194,6 +194,7 @@ func TestSubprocess_InitializeAndListTools(t *testing.T) {
 		"ynab_debt_snapshot":        false,
 		"ynab_spending_check":       false,
 		"ynab_waterfall_assignment": false,
+		"ynab_status":               false,
 	}
 	if len(tools) != len(want) {
 		t.Errorf("expected %d tools, got %d", len(want), len(tools))

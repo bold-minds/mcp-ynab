@@ -44,16 +44,17 @@ type wireAccountsResponse struct {
 }
 
 type wireAccount struct {
-	ID               string  `json:"id"`
-	Name             string  `json:"name"`
-	Type             string  `json:"type"`
-	OnBudget         bool    `json:"on_budget"`
-	Closed           bool    `json:"closed"`
-	Note             *string `json:"note"`
-	Balance          int64   `json:"balance"`
-	ClearedBalance   int64   `json:"cleared_balance"`
-	UnclearedBalance int64   `json:"uncleared_balance"`
-	Deleted          bool    `json:"deleted"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Type             string     `json:"type"`
+	OnBudget         bool       `json:"on_budget"`
+	Closed           bool       `json:"closed"`
+	Note             *string    `json:"note"`
+	Balance          int64      `json:"balance"`
+	ClearedBalance   int64      `json:"cleared_balance"`
+	UnclearedBalance int64      `json:"uncleared_balance"`
+	LastReconciledAt *time.Time `json:"last_reconciled_at"`
+	Deleted          bool       `json:"deleted"`
 }
 
 type wireCategoriesResponse struct {
@@ -215,15 +216,16 @@ type Plan struct {
 
 // Account is a YNAB account within a plan.
 type Account struct {
-	ID               string `json:"id"`
-	Name             string `json:"name"`
-	Type             string `json:"type" jsonschema:"checking|savings|cash|creditCard|...|mortgage"`
-	OnBudget         bool   `json:"on_budget"`
-	Closed           bool   `json:"closed"`
-	Note             string `json:"note,omitempty"`
-	Balance          Money  `json:"balance"`
-	ClearedBalance   Money  `json:"cleared_balance"`
-	UnclearedBalance Money  `json:"uncleared_balance"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Type             string     `json:"type" jsonschema:"checking|savings|cash|creditCard|...|mortgage"`
+	OnBudget         bool       `json:"on_budget"`
+	Closed           bool       `json:"closed"`
+	Note             string     `json:"note,omitempty"`
+	Balance          Money      `json:"balance"`
+	ClearedBalance   Money      `json:"cleared_balance"`
+	UnclearedBalance Money      `json:"uncleared_balance"`
+	LastReconciledAt *time.Time `json:"last_reconciled_at,omitempty" jsonschema:"null when the account has never been reconciled; used by ynab_status for days_since_last_reconciled"`
 }
 
 // Category is a YNAB category with amounts for its current plan month.
@@ -344,6 +346,7 @@ func toAccount(w wireAccount) Account {
 		Balance:          NewMoney(w.Balance),
 		ClearedBalance:   NewMoney(w.ClearedBalance),
 		UnclearedBalance: NewMoney(w.UnclearedBalance),
+		LastReconciledAt: w.LastReconciledAt,
 	}
 }
 

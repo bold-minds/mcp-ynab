@@ -544,6 +544,13 @@ func registerTools(server *mcp.Server, c *Client) {
 		Annotations: readOnly,
 	}, c.YnabWaterfallAssignment)
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ynab_status",
+		Title:       "YNAB Sunday ritual dashboard",
+		Description: "Dashboard snapshot in one call: Ready-to-Assign, overspent categories (with credit card payment categories excluded), debt accounts (enriched with APR and monthly interest when debt_account_config is provided), savings accounts, days-since-last-reconciled per account, unapproved transaction count, and next-7-days scheduled transaction cash flow with recurrence expansion.",
+		Annotations: readOnly,
+	}, c.YnabStatus)
+
 	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
 	// When the environment variable is unset, these tools do not appear
 	// in tools/list output and the LLM cannot call them at all. Every
