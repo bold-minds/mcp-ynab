@@ -519,6 +519,17 @@ func registerTools(server *mcp.Server, c *Client) {
 		Annotations: readOnly,
 	}, c.ListPayees)
 
+	// Task-shaped tools — composition layer over the primitives. All
+	// read-only: they may call multiple YNAB read endpoints but issue
+	// no writes.
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ynab_debt_snapshot",
+		Title:       "Debt snapshot with avalanche payoff projection",
+		Description: "Compute current debt account balances + simple monthly interest + avalanche payoff projection. APRs and minimum payments are passed as arguments by the caller (the skill owns this config, not the MCP). Optional extra_per_month_milliunits runs a second scenario showing how much faster the debt is paid off with additional monthly payment. Returns per-account snapshots and warnings for any account whose minimum payment is less than its monthly interest.",
+		Annotations: readOnly,
+	}, c.YnabDebtSnapshot)
+
 	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
 	// When the environment variable is unset, these tools do not appear
 	// in tools/list output and the LLM cannot call them at all. Every
