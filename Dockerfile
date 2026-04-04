@@ -4,7 +4,7 @@
 # distroless image. The final image has no shell, no package manager, and runs
 # as a non-root user. It communicates over stdio only — no ports are exposed.
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 RUN apk add --no-cache ca-certificates
 COPY go.mod go.sum ./
