@@ -48,7 +48,7 @@ dockers:
     use: buildx
     goos: linux
     goarch: amd64
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.goreleaser
     build_flag_templates:
       - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.source=https://github.com/bold-minds/mcp-ynab"
@@ -61,7 +61,7 @@ dockers:
     use: buildx
     goos: linux
     goarch: arm64
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.goreleaser
     build_flag_templates:
       - "--platform=linux/arm64"
       - "--label=org.opencontainers.image.source=https://github.com/bold-minds/mcp-ynab"
