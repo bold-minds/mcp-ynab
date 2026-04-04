@@ -237,6 +237,140 @@ func TestListCategories_FlattensAndFilters(t *testing.T) {
 	assertMoney(t, "Balance", out.Categories[0].Balance, 250000, "250.000")
 }
 
+// ---- list_payees -----------------------------------------------------------
+
+func TestListPayees_Success(t *testing.T) {
+	t.Parallel()
+	var seenPath string
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"payees":[
+			{"id":"p1","name":"Chipotle","transfer_account_id":null,"deleted":false},
+			{"id":"p2","name":"Whole Foods","transfer_account_id":null,"deleted":false},
+			{"id":"p3","name":"Transfer: Savings","transfer_account_id":"acct-s","deleted":false}
+		]}}`))
+	})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: "plan-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seenPath != "/plans/plan-1/payees" {
+		t.Errorf("wrong path: %s", seenPath)
+	}
+	if len(out.Payees) != 3 {
+		t.Errorf("expected 3 payees, got %d", len(out.Payees))
+	}
+	// Transfer payee should have transfer_account_id populated.
+	var transferPayee *Payee
+	for i := range out.Payees {
+		if out.Payees[i].ID == "p3" {
+			transferPayee = &out.Payees[i]
+		}
+	}
+	if transferPayee == nil || transferPayee.TransferAccountID != "acct-s" {
+		t.Errorf("transfer payee missing or wrong: %+v", transferPayee)
+	}
+}
+
+func TestListPayees_NameContainsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"payees":[
+			{"id":"p1","name":"CHIPOTLE Mexican Grill","deleted":false},
+			{"id":"p2","name":"chipotle Downtown","deleted":false},
+			{"id":"p3","name":"Whole Foods","deleted":false},
+			{"id":"p4","name":"Chick-fil-A","deleted":false}
+		]}}`))
+	})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{
+		PlanID:       "p",
+		NameContains: "chipotle",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should match p1 and p2 but not p3 or p4.
+	if len(out.Payees) != 2 {
+		t.Fatalf("expected 2 matches for 'chipotle', got %d: %+v", len(out.Payees), out.Payees)
+	}
+	seen := map[string]bool{}
+	for _, p := range out.Payees {
+		seen[p.ID] = true
+	}
+	if !seen["p1"] || !seen["p2"] {
+		t.Errorf("wrong matches: %+v", out.Payees)
+	}
+}
+
+func TestListPayees_NameContainsUppercaseInputStillCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"payees":[
+			{"id":"p1","name":"starbucks","deleted":false}
+		]}}`))
+	})
+	// Caller passes uppercase; should still match lowercase payee name.
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{
+		PlanID: "p", NameContains: "STARBUCKS",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Payees) != 1 {
+		t.Errorf("expected 1 match, got %d", len(out.Payees))
+	}
+}
+
+func TestListPayees_FiltersDeletedByDefault(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"payees":[
+			{"id":"p1","name":"Active","deleted":false},
+			{"id":"p2","name":"Deleted","deleted":true}
+		]}}`))
+	})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Payees) != 1 || out.Payees[0].Name != "Active" {
+		t.Errorf("deleted not filtered: %+v", out.Payees)
+	}
+}
+
+func TestListPayees_IncludeDeleted(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"payees":[
+			{"id":"p1","name":"Active","deleted":false},
+			{"id":"p2","name":"Deleted","deleted":true}
+		]}}`))
+	})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: "p", IncludeDeleted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Payees) != 2 {
+		t.Errorf("expected 2 with include_deleted, got %d", len(out.Payees))
+	}
+}
+
+func TestListPayees_RequiresPlanID(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called")
+	})
+	_, _, err := client.ListPayees(context.Background(), nil, ListPayeesInput{})
+	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+		t.Errorf("wrong error: %v", err)
+	}
+}
+
 // ---- list_transactions filter routing --------------------------------------
 
 func TestListTransactions_AccountFilterHitsAccountEndpoint(t *testing.T) {

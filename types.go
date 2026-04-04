@@ -167,6 +167,19 @@ type wireScheduledTransactionsResponse struct {
 	} `json:"data"`
 }
 
+type wirePayeesResponse struct {
+	Data struct {
+		Payees []wirePayee `json:"payees"`
+	} `json:"data"`
+}
+
+type wirePayee struct {
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	TransferAccountID *string `json:"transfer_account_id"`
+	Deleted           bool    `json:"deleted"`
+}
+
 type wireScheduledTransaction struct {
 	ID           string  `json:"id"`
 	DateFirst    string  `json:"date_first"`
@@ -261,6 +274,13 @@ type MonthSummary struct {
 	Activity     Money  `json:"activity"`
 	ToBeBudgeted Money  `json:"to_be_budgeted"`
 	AgeOfMoney   int    `json:"age_of_money,omitempty"`
+}
+
+// Payee is a YNAB payee as returned by list_payees.
+type Payee struct {
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	TransferAccountID string `json:"transfer_account_id,omitempty" jsonschema:"populated only for transfer-payees: the account_id this payee transfers to"`
 }
 
 // ScheduledTransaction is a recurring / future-dated transaction as returned
@@ -392,6 +412,14 @@ func toMonthSummary(w wireMonthSummary) MonthSummary {
 		out.AgeOfMoney = *w.AgeOfMoney
 	}
 	return out
+}
+
+func toPayee(w wirePayee) Payee {
+	return Payee{
+		ID:                w.ID,
+		Name:              w.Name,
+		TransferAccountID: deref(w.TransferAccountID),
+	}
 }
 
 func toScheduledTransaction(w wireScheduledTransaction) ScheduledTransaction {

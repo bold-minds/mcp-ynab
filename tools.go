@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -90,6 +91,20 @@ type ListCategoriesInput struct {
 
 type ListCategoriesOutput struct {
 	Categories []Category `json:"categories"`
+}
+
+// ListPayeesInput supports a case-insensitive substring filter so the LLM
+// can resolve "Chipotle" to a concrete payee_id without pulling the full
+// payee list on every call. For plans with hundreds of payees this is
+// meaningfully cheaper than always fetching everything.
+type ListPayeesInput struct {
+	PlanID         string `json:"plan_id" jsonschema:"YNAB plan id (UUID), or 'last-used' / 'default'"`
+	NameContains   string `json:"name_contains,omitempty" jsonschema:"case-insensitive substring filter on payee name; omit to return all payees. No regex — plain substring only."`
+	IncludeDeleted bool   `json:"include_deleted,omitempty" jsonschema:"include deleted payees; default false"`
+}
+
+type ListPayeesOutput struct {
+	Payees []Payee `json:"payees"`
 }
 
 // ---- handler methods --------------------------------------------------------
@@ -343,6 +358,29 @@ func (c *Client) ListScheduledTransactions(ctx context.Context, _ *mcp.CallToolR
 	return nil, out, nil
 }
 
+func (c *Client) ListPayees(ctx context.Context, _ *mcp.CallToolRequest, in ListPayeesInput) (*mcp.CallToolResult, ListPayeesOutput, error) {
+	if in.PlanID == "" {
+		return nil, ListPayeesOutput{}, errors.New("plan_id is required")
+	}
+	path := "/plans/" + url.PathEscape(in.PlanID) + "/payees"
+	var wire wirePayeesResponse
+	if err := c.doJSON(ctx, path, nil, &wire); err != nil {
+		return nil, ListPayeesOutput{}, sanitizedErr(err)
+	}
+	needle := strings.ToLower(in.NameContains)
+	payees := make([]Payee, 0, len(wire.Data.Payees))
+	for _, p := range wire.Data.Payees {
+		if p.Deleted && !in.IncludeDeleted {
+			continue
+		}
+		if needle != "" && !strings.Contains(strings.ToLower(p.Name), needle) {
+			continue
+		}
+		payees = append(payees, toPayee(p))
+	}
+	return nil, ListPayeesOutput{Payees: payees}, nil
+}
+
 func (c *Client) ListCategories(ctx context.Context, _ *mcp.CallToolRequest, in ListCategoriesInput) (*mcp.CallToolResult, ListCategoriesOutput, error) {
 	if in.PlanID == "" {
 		return nil, ListCategoriesOutput{}, errors.New("plan_id is required")
@@ -429,6 +467,13 @@ func registerTools(server *mcp.Server, c *Client) {
 		Description: "List recurring and future-dated scheduled transactions in date_next order (soonest first). Optionally limit to those scheduled within the next N days via upcoming_days.",
 		Annotations: readOnly,
 	}, c.ListScheduledTransactions)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_payees",
+		Title:       "List payees",
+		Description: "List all payees in a plan. Optional name_contains performs a case-insensitive substring match on payee names — use this to find specific payee IDs before calling list_transactions with payee_id or ynab_spending_check with excluded_payee_ids. Deleted payees are excluded by default.",
+		Annotations: readOnly,
+	}, c.ListPayees)
 
 	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
 	// When the environment variable is unset, these tools do not appear

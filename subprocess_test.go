@@ -189,6 +189,7 @@ func TestSubprocess_InitializeAndListTools(t *testing.T) {
 		"list_categories":             false,
 		"list_months":                 false,
 		"list_scheduled_transactions": false,
+		"list_payees":                 false,
 	}
 	if len(tools) != len(want) {
 		t.Errorf("expected %d tools, got %d", len(want), len(tools))
