@@ -73,10 +73,11 @@ type DebtPayoffProjection struct {
 
 // DebtPayoffMilestone is one step in the avalanche payoff ordering.
 type DebtPayoffMilestone struct {
-	AccountID      string `json:"account_id"`
-	Nickname       string `json:"nickname"`
-	MonthPaidOff   int    `json:"month_paid_off"`
-	BalanceAtStart Money  `json:"balance_at_start"`
+	AccountID      string  `json:"account_id"`
+	Nickname       string  `json:"nickname"`
+	MonthPaidOff   int     `json:"month_paid_off"`
+	BalanceAtStart Money   `json:"balance_at_start"`
+	APRPercent     float64 `json:"apr_percent" jsonschema:"APR carried through so the LLM can narrate 'paid off in order of highest APR first'"`
 }
 
 // DebtSnapshotWarning identifies an individual account whose minimum
@@ -147,6 +148,7 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 	snapshots := make([]DebtAccountSnapshot, 0, len(in.DebtAccountConfig))
 	balances := make([]int64, 0, len(in.DebtAccountConfig))
 	aprBps := make([]int64, 0, len(in.DebtAccountConfig))
+	aprPercents := make([]float64, 0, len(in.DebtAccountConfig))
 	minimums := make([]int64, 0, len(in.DebtAccountConfig))
 	nicknames := make([]string, 0, len(in.DebtAccountConfig))
 	ids := make([]string, 0, len(in.DebtAccountConfig))
@@ -184,6 +186,7 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 
 		balances = append(balances, owed)
 		aprBps = append(aprBps, apr)
+		aprPercents = append(aprPercents, cfg.APRPercent)
 		minimums = append(minimums, cfg.MinimumPaymentMilliunits)
 		nicknames = append(nicknames, nickname)
 		ids = append(ids, cfg.AccountID)
@@ -232,14 +235,14 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 
 	// Run simulations. Both scenarios use the same simulation function
 	// with different extraPerMonth values.
-	projMin, errMin := simulateAvalanche(balances, aprBps, minimums, ids, nicknames, 0)
+	projMin, errMin := simulateAvalanche(balances, aprBps, minimums, aprPercents, ids, nicknames, 0)
 	if errMin != nil {
 		return nil, YnabDebtSnapshotOutput{}, fmt.Errorf("minimum-only projection: %w", errMin)
 	}
 	out.ProjectionMinimumsOnly = &projMin
 
 	if in.ExtraPerMonthMilliunits > 0 {
-		projExtra, errExtra := simulateAvalanche(balances, aprBps, minimums, ids, nicknames, in.ExtraPerMonthMilliunits)
+		projExtra, errExtra := simulateAvalanche(balances, aprBps, minimums, aprPercents, ids, nicknames, in.ExtraPerMonthMilliunits)
 		if errExtra != nil {
 			return nil, YnabDebtSnapshotOutput{}, fmt.Errorf("with-extra projection: %w", errExtra)
 		}
@@ -271,9 +274,15 @@ func aprToBasisPoints(apr float64) int64 {
 //   interest     = balance * monthly_rate
 //                = balance * apr_bps / 120_000
 //
-// Floor-division error: at most 1 milliunit per call. Over a 60-month
-// × 10-account simulation that's ≤600 milliunits = $0.60, acceptable
-// for a "months to debt free" projection.
+// Floor-division error: up to ~1 milliunit per account per month. The
+// rounding direction is always "down" (never unbiased), and the error
+// compounds through the simulation because each month's interest is
+// computed on a balance that already reflects prior-month rounding.
+// Cumulative bound for a 600-month × 10-account simulation: ≤6,000
+// milliunits = ~$6 of under-reported total interest. Acceptable for a
+// "months to debt free" projection — the error is always biased toward
+// optimistic (slightly less interest than true), and in no case
+// changes the integer number of months to payoff.
 func monthlyInterestMilliunits(balanceMu, aprBps int64) int64 {
 	if balanceMu <= 0 || aprBps == 0 {
 		return 0
@@ -287,6 +296,8 @@ func monthlyInterestMilliunits(balanceMu, aprBps int64) int64 {
 // to the next-highest-APR debt).
 //
 // All input slices must be the same length and aligned by account index.
+// aprPercents carries the display-friendly APR value through to the
+// payoff milestone output so the LLM can narrate ordering by APR.
 // The function does NOT mutate its input slices.
 //
 // Simulation is capped at 600 months (50 years). If the total payment
@@ -296,6 +307,7 @@ func monthlyInterestMilliunits(balanceMu, aprBps int64) int64 {
 // total_minimums <= total_interest check.
 func simulateAvalanche(
 	initialBalances, aprBps, minimums []int64,
+	aprPercents []float64,
 	ids, nicknames []string,
 	extraPerMonth int64,
 ) (DebtPayoffProjection, error) {
@@ -404,7 +416,9 @@ func simulateAvalanche(
 	}
 
 	// Build the payoff-order list (avalanche sequence: by earliest
-	// month paid off, ties broken by APR descending).
+	// month paid off, ties broken by APR descending). APR is carried
+	// through from the input so the tiebreak comparison actually uses
+	// APR — fix for review finding B2.
 	payoffMilestones := make([]DebtPayoffMilestone, 0, n)
 	for i := range balances {
 		if paidOffMonth[i] > 0 {
@@ -413,6 +427,7 @@ func simulateAvalanche(
 				Nickname:       nicknames[i],
 				MonthPaidOff:   paidOffMonth[i],
 				BalanceAtStart: NewMoney(startingBalances[i]),
+				APRPercent:     aprPercents[i],
 			})
 		}
 	}
@@ -420,8 +435,7 @@ func simulateAvalanche(
 		if payoffMilestones[i].MonthPaidOff != payoffMilestones[j].MonthPaidOff {
 			return payoffMilestones[i].MonthPaidOff < payoffMilestones[j].MonthPaidOff
 		}
-		// Tiebreak: higher APR first (more important to highlight).
-		return payoffMilestones[i].BalanceAtStart.Milliunits > payoffMilestones[j].BalanceAtStart.Milliunits
+		return payoffMilestones[i].APRPercent > payoffMilestones[j].APRPercent
 	})
 
 	debtFreeDate := time.Now().UTC().AddDate(0, month, 0).Format("2006-01")
@@ -484,6 +498,22 @@ func countUnapprovedExcludingTransferMirrors(txns []Transaction) int {
 // string match with a documented assumption. If YNAB ever localizes,
 // this is the single place to update.
 const ynabStatusCreditCardPaymentGroupName = "Credit Card Payments"
+
+// debtAccountTypes is the set of YNAB account types that represent
+// liabilities (money the user owes). Used by both ynab_status and
+// ynab_debt_snapshot to identify debt accounts. Lifted here so that
+// any future YNAB type addition is a single-point edit across the
+// package.
+var debtAccountTypes = map[string]bool{
+	"creditCard":   true,
+	"lineOfCredit": true,
+	"mortgage":     true,
+	"autoLoan":     true,
+	"studentLoan":  true,
+	"personalLoan": true,
+	"medicalDebt":  true,
+	"otherDebt":    true,
+}
 
 // YnabStatusInput takes the debt account config as an optional argument
 // so the status view can display APR and monthly interest for debt
@@ -641,31 +671,29 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	}
 	out.CreditCardPaymentCategoriesExcludedCount = ccExcluded
 
-	// Debt accounts: YNAB's debt account types per the spec.
-	debtTypes := map[string]bool{
-		"creditCard":     true,
-		"lineOfCredit":   true,
-		"mortgage":       true,
-		"autoLoan":       true,
-		"studentLoan":    true,
-		"personalLoan":   true,
-		"medicalDebt":    true,
-		"otherDebt":      true,
-	}
+	// Debt accounts: YNAB's debt account types per the spec. Uses the
+	// package-level debtAccountTypes set shared with ynab_debt_snapshot.
 	debtCfgByID := make(map[string]DebtAccountConfig, len(in.DebtAccountConfig))
 	for _, cfg := range in.DebtAccountConfig {
 		debtCfgByID[cfg.AccountID] = cfg
 	}
 
-	// Savings accounts.
+	// Accounts pass: classify debt and savings.
 	for _, a := range accOut.Accounts {
-		if debtTypes[a.Type] {
+		if debtAccountTypes[a.Type] {
+			// YNAB stores debt as negative milliunits (owed). Flip sign
+			// for display. Clamp to 0 for credit-balance debt accounts
+			// (where the user paid more than they owe, creating a
+			// positive credit) — review finding B4. YnabDebtSnapshot
+			// already does this; YnabStatus must match.
+			owed := -a.Balance.Milliunits
+			if owed < 0 {
+				owed = 0
+			}
 			entry := DebtStatusEntry{
 				AccountID: a.ID,
 				Nickname:  a.Name,
-				// Debt accounts have negative balances; flip sign for
-				// display (positive = amount owed).
-				Balance: NewMoney(-a.Balance.Milliunits),
+				Balance:   NewMoney(owed),
 			}
 			if cfg, ok := debtCfgByID[a.ID]; ok {
 				if cfg.Nickname != "" {
@@ -675,7 +703,9 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 				entry.APRPercent = &aprCopy
 				minCopy := NewMoney(cfg.MinimumPaymentMilliunits)
 				entry.MinimumPayment = &minCopy
-				interest := monthlyInterestMilliunits(-a.Balance.Milliunits, aprToBasisPoints(cfg.APRPercent))
+				// Use the clamped owed amount for interest — no interest
+				// on a credit balance.
+				interest := monthlyInterestMilliunits(owed, aprToBasisPoints(cfg.APRPercent))
 				if interest < 0 {
 					interest = 0
 				}

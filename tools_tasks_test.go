@@ -1244,6 +1244,54 @@ func TestWeeklyCheckin_BadDateRejected(t *testing.T) {
 	}
 }
 
+// TestStatus_CreditBalanceOnDebtAccountClampsToZero is the B4 regression.
+// A user who overpays a credit card has a positive balance (a credit) on
+// that debt account. YNAB stores it as a positive wire balance. The
+// status dashboard should display amount-owed as $0, NOT as a negative
+// number ("you owe negative fifty dollars" is nonsense).
+func TestStatus_CreditBalanceOnDebtAccountClampsToZero(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/months/current"):
+			_, _ = w.Write([]byte(`{"data":{"month":{"month":"2026-04-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,"categories":[]}}}`))
+		case strings.HasSuffix(r.URL.Path, "/accounts"):
+			// Credit balance: positive wire value on a credit card account.
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"accounts":[
+				{"id":"cc","name":"Visa","type":"creditCard","on_budget":true,"closed":false,"balance":50000,"cleared_balance":50000,"uncleared_balance":0,"deleted":false}
+			]}}`))
+		case strings.HasSuffix(r.URL.Path, "/categories"):
+			_, _ = w.Write([]byte(`{"data":{"category_groups":[]}}`))
+		case r.URL.Query().Get("type") == "unapproved":
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/scheduled_transactions"):
+			_, _ = w.Write([]byte(`{"data":{"scheduled_transactions":[]}}`))
+		default:
+			http.Error(w, "unexpected URL: "+r.URL.Path, http.StatusNotFound)
+		}
+	})
+	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{
+		PlanID: "p",
+		DebtAccountConfig: []DebtAccountConfig{
+			{AccountID: "cc", Nickname: "Visa", APRPercent: 24, MinimumPaymentMilliunits: 0},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.DebtAccounts) != 1 {
+		t.Fatalf("expected 1 debt account, got %d", len(out.DebtAccounts))
+	}
+	if out.DebtAccounts[0].Balance.Milliunits != 0 {
+		t.Errorf("credit balance should clamp to 0 owed, got %d", out.DebtAccounts[0].Balance.Milliunits)
+	}
+	// Interest should also be zero — no interest on a credit balance.
+	if out.DebtAccounts[0].MonthlyInterest != nil && out.DebtAccounts[0].MonthlyInterest.Milliunits != 0 {
+		t.Errorf("interest on credit balance should be 0, got %d", out.DebtAccounts[0].MonthlyInterest.Milliunits)
+	}
+}
+
 func TestStatus_RequiresPlanID(t *testing.T) {
 	t.Parallel()
 	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
