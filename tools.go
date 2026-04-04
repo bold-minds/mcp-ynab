@@ -429,6 +429,39 @@ func registerTools(server *mcp.Server, c *Client) {
 		Description: "List recurring and future-dated scheduled transactions in date_next order (soonest first). Optionally limit to those scheduled within the next N days via upcoming_days.",
 		Annotations: readOnly,
 	}, c.ListScheduledTransactions)
+
+	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
+	// When the environment variable is unset, these tools do not appear
+	// in tools/list output and the LLM cannot call them at all. Every
+	// handler also performs a per-call re-check as defense-in-depth.
+	if writeAllowed() {
+		destructive := false
+		idempotent := true
+		mutating := &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: &destructive, // creates new entities, doesn't destroy
+			IdempotentHint:  idempotent,   // import_id-based dedup at YNAB
+		}
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "create_transaction",
+			Title:       "Create transaction",
+			Description: "Create a new transaction in YNAB. Requires YNAB_ALLOW_WRITES=1. Asks the MCP client to confirm before executing. Amounts >$10K require an echo-back amount_override_milliunits acknowledgment. Provide an import_id to dedupe idempotently on retry.",
+			Annotations: mutating,
+		}, c.CreateTransaction)
+
+		destructiveBudget := false
+		mutatingBudget := &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: &destructiveBudget, // updates assigned amount, not destructive
+			IdempotentHint:  true,               // same budgeted twice == same final state
+		}
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "update_category_budgeted",
+			Title:       "Update category assigned amount",
+			Description: "Change the assigned (budgeted) amount on a single category for a single plan month. Primitive for Rule 3 money moves during the Sunday ritual. Requires YNAB_ALLOW_WRITES=1. Asks the MCP client to confirm before executing, showing the before/after delta. Returns before and after snapshots of budgeted and balance.",
+			Annotations: mutatingBudget,
+		}, c.UpdateCategoryBudgeted)
+	}
 }
 
 // sanitizedErr runs a final sanitize pass on an error's string form before it

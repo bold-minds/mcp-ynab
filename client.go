@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -188,7 +189,27 @@ func NewClient(token Token) (*Client, error) {
 // not an absolute URL. Query parameters may be provided via query. All error
 // paths return sanitized errors — the Authorization header is never echoed
 // and the raw response body is never included verbatim.
+//
+// doJSON is a thin wrapper around doJSONWithBody for the common GET case.
+// Read handlers call this; write handlers call doJSONWithBody directly.
 func (c *Client) doJSON(ctx context.Context, path string, query url.Values, out any) error {
+	return c.doJSONWithBody(ctx, http.MethodGet, path, query, nil, out)
+}
+
+// doJSONWithBody is the low-level HTTP entry point. It is shared by read
+// (GET) and write (POST / PATCH / PUT) paths. All outbound requests flow
+// through this one function, which means:
+//
+//   - The host-locked RoundTripper enforces api.ynab.com on every call.
+//   - The rate limiter fires on every call.
+//   - Authorization header injection happens in exactly one place.
+//   - c.token.reveal() is called in exactly one place (below).
+//   - Error sanitization is consistent across read and write paths.
+//
+// body is marshaled to JSON if non-nil; for reads callers pass nil. out is
+// decoded from the response body; callers may pass nil if they do not need
+// the response (e.g. for write tools that only care about success).
+func (c *Client) doJSONWithBody(ctx context.Context, method, path string, query url.Values, body, out any) error {
 	if strings.Contains(path, "://") {
 		return errors.New("ynab: absolute URL not allowed")
 	}
@@ -196,7 +217,17 @@ func (c *Client) doJSON(ctx context.Context, path string, query url.Values, out 
 	if len(query) > 0 {
 		reqURL += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+
+	var bodyReader io.Reader
+	if body != nil {
+		marshaled, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("ynab: marshal request body: %w", err)
+		}
+		bodyReader = bytes.NewReader(marshaled)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
 	if err != nil {
 		return fmt.Errorf("ynab: build request: %w", err)
 	}
@@ -206,15 +237,19 @@ func (c *Client) doJSON(ctx context.Context, path string, query url.Values, out 
 	req.Header.Set("Authorization", "Bearer "+c.token.reveal())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "mcp-ynab/"+Version)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		// http.Client wraps transport errors in *url.Error. Its Error()
-		// method formats the method and URL but never the request headers,
-		// so the token cannot leak through this path. Our URLs never
-		// contain secrets. As additional defense in depth, the caller runs
-		// sanitize() over the final error string before returning to the
-		// MCP client.
+		// method formats the method and URL but never the request headers
+		// or the request body, so neither the token nor the submitted
+		// write payload can leak through this path. Our URLs never
+		// contain secrets. As additional defense in depth, the caller
+		// runs sanitize() over the final error string before returning
+		// to the MCP client.
 		return fmt.Errorf("ynab: request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -223,11 +258,18 @@ func (c *Client) doJSON(ctx context.Context, path string, query url.Values, out 
 		return apiError(resp)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if out == nil {
+		// Caller explicitly wants no decode. Still read and discard the
+		// body to let the underlying connection be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
+		return nil
+	}
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return fmt.Errorf("ynab: read response: %w", err)
 	}
-	if err := json.Unmarshal(body, out); err != nil {
+	if err := json.Unmarshal(respBody, out); err != nil {
 		return fmt.Errorf("ynab: decode response: %w", err)
 	}
 	return nil

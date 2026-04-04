@@ -45,6 +45,13 @@ type mcpSession struct {
 }
 
 func startSession(t *testing.T, bin string) *mcpSession {
+	return startSessionWithEnv(t, bin, nil)
+}
+
+// startSessionWithEnv is like startSession but lets the caller pass additional
+// environment variables to the subprocess. Used for tests that need to
+// toggle YNAB_ALLOW_WRITES.
+func startSessionWithEnv(t *testing.T, bin string, extraEnv []string) *mcpSession {
 	t.Helper()
 	// Use a throwaway token — the SDK handshake and validation layers fire
 	// before any YNAB HTTP call, which is what we are testing. Handler
@@ -52,6 +59,7 @@ func startSession(t *testing.T, bin string) *mcpSession {
 	// fine for assertion purposes.
 	cmd := exec.Command(bin)
 	cmd.Env = append(cmd.Environ(), "YNAB_API_TOKEN=sk-subprocess-test")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -201,6 +209,87 @@ func TestSubprocess_InitializeAndListTools(t *testing.T) {
 	for name, saw := range want {
 		if !saw {
 			t.Errorf("missing tool %q", name)
+		}
+	}
+}
+
+// TestSubprocess_WritesGatedOffWhenEnvUnset verifies that when the process
+// is started WITHOUT YNAB_ALLOW_WRITES=1, the write tools are not registered
+// and do not appear in tools/list output. This is the startup gate (the
+// per-call gate is covered by unit tests in tools_writes_test.go).
+func TestSubprocess_WritesGatedOffWhenEnvUnset(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess test in -short mode")
+	}
+	bin := buildTestBinary(t)
+	s := startSession(t, bin) // no YNAB_ALLOW_WRITES
+
+	s.send(t, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "t", "version": "0"},
+		},
+	})
+	_ = s.recvMatching(t, 1, 5*time.Second)
+	s.send(t, map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	s.send(t, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+	resp := s.recvMatching(t, 2, 5*time.Second)
+	tools := resp["result"].(map[string]any)["tools"].([]any)
+	for _, ti := range tools {
+		name := ti.(map[string]any)["name"].(string)
+		if strings.HasPrefix(name, "create_") || strings.HasPrefix(name, "update_") || strings.HasPrefix(name, "approve_") {
+			t.Errorf("write tool %q should NOT be registered when YNAB_ALLOW_WRITES is unset", name)
+		}
+	}
+}
+
+// TestSubprocess_WritesRegisteredWhenGateOn verifies that with
+// YNAB_ALLOW_WRITES=1, the write tools from step 2 (create_transaction,
+// update_category_budgeted) appear in tools/list with readOnlyHint=false.
+// This test grows as more write tools and task-shaped tools land in later
+// steps.
+func TestSubprocess_WritesRegisteredWhenGateOn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess test in -short mode")
+	}
+	bin := buildTestBinary(t)
+	s := startSessionWithEnv(t, bin, []string{"YNAB_ALLOW_WRITES=1"})
+
+	s.send(t, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "t", "version": "0"},
+		},
+	})
+	_ = s.recvMatching(t, 1, 5*time.Second)
+	s.send(t, map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	s.send(t, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+	resp := s.recvMatching(t, 2, 5*time.Second)
+	tools := resp["result"].(map[string]any)["tools"].([]any)
+	// Tools currently expected when writes are enabled. Grows in later steps.
+	expectedWrites := map[string]bool{
+		"create_transaction":       false,
+		"update_category_budgeted": false,
+	}
+	for _, ti := range tools {
+		tm := ti.(map[string]any)
+		name := tm["name"].(string)
+		if _, isWrite := expectedWrites[name]; isWrite {
+			expectedWrites[name] = true
+			// Write tools should report readOnlyHint=false.
+			ann, _ := tm["annotations"].(map[string]any)
+			if ro, _ := ann["readOnlyHint"].(bool); ro {
+				t.Errorf("write tool %q should not have readOnlyHint=true", name)
+			}
+		}
+	}
+	for name, saw := range expectedWrites {
+		if !saw {
+			t.Errorf("write tool %q missing from tools/list when YNAB_ALLOW_WRITES=1", name)
 		}
 	}
 }
