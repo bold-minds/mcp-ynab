@@ -551,6 +551,245 @@ func TestSpendingCheck_InputValidation(t *testing.T) {
 	}
 }
 
+// ---- ynab_waterfall_assignment ---------------------------------------------
+
+// waterfallMonthHandler returns a canned get_month response for waterfall
+// tests: 3 categories with known budgeted/balance so the tests can verify
+// current_budgeted passthrough in the output.
+func waterfallMonthHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/months/") {
+			http.Error(w, "waterfall_assignment should call get_month", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"month":{
+			"month":"2026-04-01","income":5000000,"budgeted":2500000,"activity":-800000,"to_be_budgeted":1500000,
+			"categories":[
+				{"id":"cat-rent","category_group_id":"g1","category_group_name":"Immediate","name":"Rent","budgeted":1500000,"activity":0,"balance":1500000,"deleted":false},
+				{"id":"cat-groc","category_group_id":"g1","category_group_name":"Immediate","name":"Groceries","budgeted":400000,"activity":-100000,"balance":300000,"deleted":false},
+				{"id":"cat-vac","category_group_id":"g2","category_group_name":"True Expenses","name":"Vacation","budgeted":600000,"activity":0,"balance":600000,"deleted":false}
+			]
+		}}}`))
+	}
+}
+
+func TestWaterfall_FullyFundsAllTiersInOrder(t *testing.T) {
+	t.Parallel()
+	// Incoming: $10 (10_000_000 milliunits). Tier 1 needs $5M, tier 2 needs $3M.
+	// Both fully funded; remainder = $2M.
+	client, _ := testClient(t, waterfallMonthHandler())
+	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
+		PlanID:                   "p",
+		IncomingAmountMilliunits: 10_000_000,
+		PriorityTiers: []WaterfallTier{
+			{
+				Name: "Immediate Obligations",
+				Categories: []WaterfallCategory{
+					{CategoryID: "cat-rent", NeedMilliunits: 3_000_000},
+					{CategoryID: "cat-groc", NeedMilliunits: 2_000_000},
+				},
+			},
+			{
+				Name: "True Expenses",
+				Categories: []WaterfallCategory{
+					{CategoryID: "cat-vac", NeedMilliunits: 3_000_000},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Remainder.Milliunits != 2_000_000 {
+		t.Errorf("expected $2M remainder, got %d", out.Remainder.Milliunits)
+	}
+	// All 3 allocations at full need.
+	if len(out.ProposedAllocations) != 3 {
+		t.Fatalf("expected 3 allocations, got %d", len(out.ProposedAllocations))
+	}
+	for _, a := range out.ProposedAllocations {
+		switch a.CategoryID {
+		case "cat-rent":
+			if a.AdditionalAssignment.Milliunits != 3_000_000 {
+				t.Errorf("rent should get $3M, got %d", a.AdditionalAssignment.Milliunits)
+			}
+			// new_budgeted = current_budgeted ($1.5M) + $3M = $4.5M
+			if a.NewBudgeted.Milliunits != 4_500_000 {
+				t.Errorf("rent new_budgeted should be $4.5M, got %d", a.NewBudgeted.Milliunits)
+			}
+		case "cat-groc":
+			if a.AdditionalAssignment.Milliunits != 2_000_000 {
+				t.Errorf("groceries should get $2M, got %d", a.AdditionalAssignment.Milliunits)
+			}
+		case "cat-vac":
+			if a.AdditionalAssignment.Milliunits != 3_000_000 {
+				t.Errorf("vacation should get $3M, got %d", a.AdditionalAssignment.Milliunits)
+			}
+		}
+	}
+	// Tier summaries: both fully funded, short_by = 0
+	for _, ts := range out.TierSummary {
+		if ts.ShortBy.Milliunits != 0 {
+			t.Errorf("tier %s should be fully funded, short_by=%d", ts.TierName, ts.ShortBy.Milliunits)
+		}
+	}
+}
+
+func TestWaterfall_PartialFundRunsOut(t *testing.T) {
+	t.Parallel()
+	// Incoming: $3M. Tier 1 needs $5M total → partially funded.
+	// stop_if_unfunded=false (default), so tier 2 gets what's left (nothing).
+	client, _ := testClient(t, waterfallMonthHandler())
+	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
+		PlanID:                   "p",
+		IncomingAmountMilliunits: 3_000_000,
+		PriorityTiers: []WaterfallTier{
+			{
+				Name: "Tier1",
+				Categories: []WaterfallCategory{
+					{CategoryID: "cat-rent", NeedMilliunits: 3_000_000}, // gets all $3M
+					{CategoryID: "cat-groc", NeedMilliunits: 2_000_000}, // gets $0 (exhausted)
+				},
+			},
+			{
+				Name: "Tier2",
+				Categories: []WaterfallCategory{
+					{CategoryID: "cat-vac", NeedMilliunits: 1_000_000}, // gets $0
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Remainder.Milliunits != 0 {
+		t.Errorf("expected 0 remainder, got %d", out.Remainder.Milliunits)
+	}
+	// rent: 3M, groc: 0, vac: 0
+	var rent, groc, vac int64
+	for _, a := range out.ProposedAllocations {
+		switch a.CategoryID {
+		case "cat-rent":
+			rent = a.AdditionalAssignment.Milliunits
+		case "cat-groc":
+			groc = a.AdditionalAssignment.Milliunits
+		case "cat-vac":
+			vac = a.AdditionalAssignment.Milliunits
+		}
+	}
+	if rent != 3_000_000 || groc != 0 || vac != 0 {
+		t.Errorf("wrong allocations: rent=%d groc=%d vac=%d", rent, groc, vac)
+	}
+	// Tier1 short_by = 2_000_000, Tier2 short_by = 1_000_000
+	var t1Short, t2Short int64
+	for _, ts := range out.TierSummary {
+		switch ts.TierName {
+		case "Tier1":
+			t1Short = ts.ShortBy.Milliunits
+		case "Tier2":
+			t2Short = ts.ShortBy.Milliunits
+		}
+	}
+	if t1Short != 2_000_000 {
+		t.Errorf("Tier1 should be short $2M, got %d", t1Short)
+	}
+	if t2Short != 1_000_000 {
+		t.Errorf("Tier2 should be short $1M, got %d", t2Short)
+	}
+}
+
+func TestWaterfall_StopIfUnfundedHaltsSubsequentTiers(t *testing.T) {
+	t.Parallel()
+	// Same setup as partial fund, but stop_if_unfunded=true on Tier1.
+	// Tier2 should NOT allocate even if we had funds left.
+	client, _ := testClient(t, waterfallMonthHandler())
+	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
+		PlanID:                   "p",
+		IncomingAmountMilliunits: 10_000_000, // plenty of funds
+		PriorityTiers: []WaterfallTier{
+			{
+				Name:           "Tier1",
+				StopIfUnfunded: true,
+				Categories: []WaterfallCategory{
+					{CategoryID: "cat-rent", NeedMilliunits: 100_000_000}, // impossible to fund fully
+				},
+			},
+			{
+				Name: "Tier2",
+				Categories: []WaterfallCategory{
+					{CategoryID: "cat-vac", NeedMilliunits: 1_000_000},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rent got all $10M (less than needed $100M).
+	// Vacation got ZERO because Tier1 triggered stop_if_unfunded.
+	for _, a := range out.ProposedAllocations {
+		if a.CategoryID == "cat-vac" && a.AdditionalAssignment.Milliunits != 0 {
+			t.Errorf("cat-vac should be 0 (stop_if_unfunded), got %d", a.AdditionalAssignment.Milliunits)
+		}
+	}
+	// Remainder = 0 (all $10M went to rent, though rent needed $100M)
+	if out.Remainder.Milliunits != 0 {
+		t.Errorf("expected 0 remainder, got %d", out.Remainder.Milliunits)
+	}
+}
+
+func TestWaterfall_ZeroIncoming(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, waterfallMonthHandler())
+	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
+		PlanID:                   "p",
+		IncomingAmountMilliunits: 0,
+		PriorityTiers: []WaterfallTier{
+			{Name: "T", Categories: []WaterfallCategory{{CategoryID: "cat-rent", NeedMilliunits: 1000000}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Remainder.Milliunits != 0 {
+		t.Errorf("expected 0 remainder, got %d", out.Remainder.Milliunits)
+	}
+	for _, a := range out.ProposedAllocations {
+		if a.AdditionalAssignment.Milliunits != 0 {
+			t.Errorf("all allocations should be 0 with zero incoming")
+		}
+	}
+}
+
+func TestWaterfall_InputValidation(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called on input validation failures")
+	})
+	cases := []struct {
+		name string
+		in   YnabWaterfallAssignmentInput
+		want string
+	}{
+		{"no plan", YnabWaterfallAssignmentInput{IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: 500}}}}}, "plan_id"},
+		{"negative incoming", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: -1, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: 500}}}}}, "non-negative"},
+		{"empty tiers", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000}, "at least one tier"},
+		{"tier missing name", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: 500}}}}}, "name is required"},
+		{"tier empty categories", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t"}}}, "at least one category"},
+		{"category missing id", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{NeedMilliunits: 500}}}}}, "category_id is required"},
+		{"negative need", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: -1}}}}}, "non-negative"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, err := client.YnabWaterfallAssignment(context.Background(), nil, c.in)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("expected error containing %q, got %v", c.want, err)
+			}
+		})
+	}
+}
+
 func TestMonthlyInterestMilliunits(t *testing.T) {
 	t.Parallel()
 	// $1000 balance, 12% APR → $10/month interest.

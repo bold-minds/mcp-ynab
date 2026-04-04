@@ -537,6 +537,13 @@ func registerTools(server *mcp.Server, c *Client) {
 		Annotations: readOnly,
 	}, c.YnabSpendingCheck)
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ynab_waterfall_assignment",
+		Title:       "Waterfall assignment (advisory, no writes)",
+		Description: "Walk a priority waterfall to propose per-category allocations for an incoming amount. Advisory ONLY — issues no writes to YNAB; the LLM presents the output and, if approved, calls update_category_budgeted separately. Each tier contains a list of categories with explicit need_milliunits the skill has computed. Respects stop_if_unfunded per tier.",
+		Annotations: readOnly,
+	}, c.YnabWaterfallAssignment)
+
 	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
 	// When the environment variable is unset, these tools do not appear
 	// in tools/list output and the LLM cannot call them at all. Every

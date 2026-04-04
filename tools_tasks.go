@@ -599,3 +599,193 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 func payeeIDForTransaction(t Transaction) string {
 	return t.PayeeID
 }
+
+// ============================================================================
+// ynab_waterfall_assignment — advisory priority allocation (no writes)
+// ============================================================================
+
+// WaterfallTier is one level of the user's assignment priority waterfall.
+// The skill computes `need_milliunits` per category from its own config
+// (goal targets, user rules, last month's budgeted, etc.) and passes
+// the result in — the MCP performs pure allocation math with no
+// inference about what "need" means.
+type WaterfallTier struct {
+	Name            string               `json:"name" jsonschema:"tier name for display, e.g. 'Immediate Obligations'"`
+	StopIfUnfunded  bool                 `json:"stop_if_unfunded,omitempty" jsonschema:"if true, the waterfall stops allocating to subsequent tiers when this tier's needs cannot be fully funded. Default false: underfunded tiers are partially allocated and the waterfall continues."`
+	Categories      []WaterfallCategory  `json:"categories" jsonschema:"the categories in this tier with their individual need amounts"`
+}
+
+// WaterfallCategory is one category in a tier, with the amount the
+// skill says this category needs allocated in the current cycle.
+type WaterfallCategory struct {
+	CategoryID     string `json:"category_id" jsonschema:"YNAB category id (UUID)"`
+	NeedMilliunits int64  `json:"need_milliunits" jsonschema:"amount the skill says this category needs allocated in this waterfall pass (must be non-negative)"`
+}
+
+// YnabWaterfallAssignmentInput asks the MCP to walk a priority waterfall
+// and propose per-category allocations given an incoming amount. This
+// tool issues NO writes — it is purely advisory. The LLM presents the
+// output to the user; if approved, the LLM then issues
+// update_category_budgeted calls.
+type YnabWaterfallAssignmentInput struct {
+	PlanID                  string          `json:"plan_id" jsonschema:"YNAB plan id, or 'last-used' / 'default'"`
+	IncomingAmountMilliunits int64          `json:"incoming_amount_milliunits" jsonschema:"amount to allocate across the waterfall (milliunits, non-negative)"`
+	PriorityTiers           []WaterfallTier `json:"priority_tiers" jsonschema:"tiers in priority order: the first tier is funded first, then the second, etc."`
+	Month                   string          `json:"month,omitempty" jsonschema:"month to read current budgeted/balance from for the output. ISO month (YYYY-MM-01) or 'current'. Defaults to 'current'."`
+}
+
+// WaterfallAllocation is one proposed per-category assignment in the
+// output. new_budgeted is the value the skill should pass to
+// update_category_budgeted if the user approves.
+type WaterfallAllocation struct {
+	TierName             string `json:"tier_name"`
+	CategoryID           string `json:"category_id"`
+	CategoryName         string `json:"category_name"`
+	CurrentBudgeted      Money  `json:"current_budgeted"`
+	CurrentBalance       Money  `json:"current_balance"`
+	AdditionalAssignment Money  `json:"additional_assignment" jsonschema:"the increment to add to current_budgeted"`
+	NewBudgeted          Money  `json:"new_budgeted" jsonschema:"current_budgeted + additional_assignment; pass this to update_category_budgeted"`
+}
+
+// WaterfallTierSummary is a per-tier rollup of needs and allocations.
+type WaterfallTierSummary struct {
+	TierName  string `json:"tier_name"`
+	Needed    Money  `json:"needed"`
+	Allocated Money  `json:"allocated"`
+	ShortBy   Money  `json:"short_by" jsonschema:"needed - allocated; zero when the tier was fully funded"`
+}
+
+// YnabWaterfallAssignmentOutput is the proposed plan for the skill/LLM
+// to present and (optionally) execute.
+type YnabWaterfallAssignmentOutput struct {
+	Incoming             Money                  `json:"incoming"`
+	ProposedAllocations  []WaterfallAllocation  `json:"proposed_allocations"`
+	TierSummary          []WaterfallTierSummary `json:"tier_summary"`
+	Remainder            Money                  `json:"remainder" jsonschema:"amount left over after the waterfall completed; the skill decides whether to park it in Ready-to-Assign or on a further tier"`
+}
+
+// YnabWaterfallAssignment walks the waterfall and returns proposed
+// allocations. Zero writes to YNAB; the skill calls update_category_budgeted
+// separately if the user approves.
+func (c *Client) YnabWaterfallAssignment(ctx context.Context, _ *mcp.CallToolRequest, in YnabWaterfallAssignmentInput) (*mcp.CallToolResult, YnabWaterfallAssignmentOutput, error) {
+	if in.PlanID == "" {
+		return nil, YnabWaterfallAssignmentOutput{}, errors.New("plan_id is required")
+	}
+	if in.IncomingAmountMilliunits < 0 {
+		return nil, YnabWaterfallAssignmentOutput{}, errors.New("incoming_amount_milliunits must be non-negative")
+	}
+	if len(in.PriorityTiers) == 0 {
+		return nil, YnabWaterfallAssignmentOutput{}, errors.New("priority_tiers must contain at least one tier")
+	}
+	for i, tier := range in.PriorityTiers {
+		if tier.Name == "" {
+			return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d].name is required", i)
+		}
+		if len(tier.Categories) == 0 {
+			return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d] (%q) must contain at least one category", i, tier.Name)
+		}
+		for j, cat := range tier.Categories {
+			if cat.CategoryID == "" {
+				return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d].categories[%d].category_id is required", i, j)
+			}
+			if cat.NeedMilliunits < 0 {
+				return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d].categories[%d].need_milliunits must be non-negative", i, j)
+			}
+		}
+	}
+
+	// Fetch current category state so the output carries current_budgeted
+	// and current_balance for display. We use the month-specific category
+	// list via get_month, which returns Category values with current-month
+	// budgeted and balance.
+	month := in.Month
+	if month == "" {
+		month = "current"
+	}
+	_, monthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: month})
+	if err != nil {
+		return nil, YnabWaterfallAssignmentOutput{}, sanitizedErr(err)
+	}
+	byID := make(map[string]Category, len(monthOut.Categories))
+	for _, c := range monthOut.Categories {
+		byID[c.ID] = c
+	}
+
+	// Walk the waterfall. For each tier in order, iterate its categories
+	// and allocate min(need, remaining). Track tier totals. Respect
+	// stop_if_unfunded.
+	remaining := in.IncomingAmountMilliunits
+	allocations := make([]WaterfallAllocation, 0)
+	tierSummaries := make([]WaterfallTierSummary, 0, len(in.PriorityTiers))
+
+	stopAllocatingRemainingTiers := false
+	for _, tier := range in.PriorityTiers {
+		var tierNeeded, tierAllocated int64
+		for _, cat := range tier.Categories {
+			tierNeeded += cat.NeedMilliunits
+			if stopAllocatingRemainingTiers {
+				// Subsequent tiers get a record with zero allocation so
+				// the LLM can see what was skipped, but no money is moved.
+				current, ok := byID[cat.CategoryID]
+				if !ok {
+					current = Category{ID: cat.CategoryID}
+				}
+				allocations = append(allocations, WaterfallAllocation{
+					TierName:             tier.Name,
+					CategoryID:           cat.CategoryID,
+					CategoryName:         current.Name,
+					CurrentBudgeted:      current.Budgeted,
+					CurrentBalance:       current.Balance,
+					AdditionalAssignment: NewMoney(0),
+					NewBudgeted:          current.Budgeted,
+				})
+				continue
+			}
+			alloc := cat.NeedMilliunits
+			if alloc > remaining {
+				alloc = remaining
+			}
+			if alloc < 0 {
+				alloc = 0
+			}
+			tierAllocated += alloc
+			remaining -= alloc
+
+			current, ok := byID[cat.CategoryID]
+			if !ok {
+				// Category not found in current month. Still record the
+				// allocation with zero current values; the skill should
+				// log the mismatch.
+				current = Category{ID: cat.CategoryID}
+			}
+			newBudgetedMu := current.Budgeted.Milliunits + alloc
+			allocations = append(allocations, WaterfallAllocation{
+				TierName:             tier.Name,
+				CategoryID:           cat.CategoryID,
+				CategoryName:         current.Name,
+				CurrentBudgeted:      current.Budgeted,
+				CurrentBalance:       current.Balance,
+				AdditionalAssignment: NewMoney(alloc),
+				NewBudgeted:          NewMoney(newBudgetedMu),
+			})
+		}
+		tierSummaries = append(tierSummaries, WaterfallTierSummary{
+			TierName:  tier.Name,
+			Needed:    NewMoney(tierNeeded),
+			Allocated: NewMoney(tierAllocated),
+			ShortBy:   NewMoney(tierNeeded - tierAllocated),
+		})
+		// stop_if_unfunded: halt allocating to subsequent tiers if this
+		// tier could not be fully funded.
+		if tier.StopIfUnfunded && tierAllocated < tierNeeded {
+			stopAllocatingRemainingTiers = true
+		}
+	}
+
+	return nil, YnabWaterfallAssignmentOutput{
+		Incoming:            NewMoney(in.IncomingAmountMilliunits),
+		ProposedAllocations: allocations,
+		TierSummary:         tierSummaries,
+		Remainder:           NewMoney(remaining),
+	}, nil
+}
