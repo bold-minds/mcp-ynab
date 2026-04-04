@@ -530,6 +530,13 @@ func registerTools(server *mcp.Server, c *Client) {
 		Annotations: readOnly,
 	}, c.YnabDebtSnapshot)
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ynab_spending_check",
+		Title:       "Spending check against budget",
+		Description: "Did the user stay on plan? Sums net outflow across one or more categories over a date range, compares to a budget, and returns on_plan (bool), actual vs budget delta, and — when over — the full list of offending transactions sorted by size. Use excluded_payee_ids to carve out exceptions like 'Chipotle on date nights'. Use list_payees with name_contains first to resolve payee names to ids.",
+		Annotations: readOnly,
+	}, c.YnabSpendingCheck)
+
 	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
 	// When the environment variable is unset, these tools do not appear
 	// in tools/list output and the LLM cannot call them at all. Every

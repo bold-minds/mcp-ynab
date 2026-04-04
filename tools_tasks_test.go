@@ -364,6 +364,193 @@ func TestAPRToBasisPoints(t *testing.T) {
 	}
 }
 
+// ---- ynab_spending_check ---------------------------------------------------
+
+// categoryTxnHandler builds an httptest handler that returns a canned
+// transactions response when called against a category-scope endpoint.
+// It hands the same response regardless of category_id — tests that
+// need per-category differentiation use their own handlers.
+func categoryTxnHandler(body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/categories/") {
+			http.Error(w, "spending_check should call category-scoped endpoint", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}
+}
+
+func TestSpendingCheck_UnderBudget(t *testing.T) {
+	t.Parallel()
+	// $300 budget, $200 of spending → under plan, no offending txns.
+	client, _ := testClient(t, categoryTxnHandler(`{"data":{"server_knowledge":1,"transactions":[
+		{"id":"t1","type":"transaction","date":"2026-04-03","amount":-100000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p1","payee_name":"WholeFoods","category_name":"Groceries","deleted":false},
+		{"id":"t2","type":"transaction","date":"2026-04-05","amount":-100000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p2","payee_name":"Target","category_name":"Groceries","deleted":false}
+	]}}`))
+	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
+		PlanID:           "p",
+		CategoryIDs:      []string{"cat-groceries"},
+		StartDate:        "2026-04-01",
+		EndDate:          "2026-04-07",
+		BudgetMilliunits: 300_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.OnPlan {
+		t.Errorf("expected on_plan=true, got delta=%d", out.DeltaMilliunits)
+	}
+	if out.ActualMilliunits != 200_000 {
+		t.Errorf("expected actual=200_000 ($200), got %d", out.ActualMilliunits)
+	}
+	if out.DeltaMilliunits != -100_000 {
+		t.Errorf("expected delta=-100_000 ($100 under), got %d", out.DeltaMilliunits)
+	}
+	if len(out.OffendingTransactions) != 0 {
+		t.Errorf("should not include offending transactions when under plan, got %d", len(out.OffendingTransactions))
+	}
+	if out.TransactionCount != 2 {
+		t.Errorf("expected 2 transactions, got %d", out.TransactionCount)
+	}
+}
+
+func TestSpendingCheck_OverBudgetIncludesOffendingSortedBySize(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, categoryTxnHandler(`{"data":{"server_knowledge":1,"transactions":[
+		{"id":"small","type":"transaction","date":"2026-04-02","amount":-30000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false},
+		{"id":"big","type":"transaction","date":"2026-04-05","amount":-250000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false},
+		{"id":"medium","type":"transaction","date":"2026-04-06","amount":-80000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false}
+	]}}`))
+	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
+		PlanID:           "p",
+		CategoryIDs:      []string{"cat"},
+		StartDate:        "2026-04-01",
+		EndDate:          "2026-04-07",
+		BudgetMilliunits: 300_000, // $300 budget, $360 spent → $60 over
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.OnPlan {
+		t.Errorf("expected on_plan=false")
+	}
+	if out.ActualMilliunits != 360_000 {
+		t.Errorf("expected 360_000 actual, got %d", out.ActualMilliunits)
+	}
+	if out.DeltaMilliunits != 60_000 {
+		t.Errorf("expected 60_000 delta, got %d", out.DeltaMilliunits)
+	}
+	// Offending transactions should be sorted biggest-first.
+	if len(out.OffendingTransactions) != 3 {
+		t.Fatalf("expected 3 offending, got %d", len(out.OffendingTransactions))
+	}
+	wantOrder := []string{"big", "medium", "small"}
+	for i, w := range wantOrder {
+		if out.OffendingTransactions[i].ID != w {
+			t.Errorf("pos %d: expected %q, got %q", i, w, out.OffendingTransactions[i].ID)
+		}
+	}
+}
+
+func TestSpendingCheck_RefundsOffsetSpending(t *testing.T) {
+	t.Parallel()
+	// $100 purchase, $30 refund → net $70 spent.
+	client, _ := testClient(t, categoryTxnHandler(`{"data":{"server_knowledge":1,"transactions":[
+		{"id":"buy","type":"transaction","date":"2026-04-03","amount":-100000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Shopping","deleted":false},
+		{"id":"refund","type":"transaction","date":"2026-04-05","amount":30000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Shopping","deleted":false}
+	]}}`))
+	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
+		PlanID:           "p",
+		CategoryIDs:      []string{"cat"},
+		StartDate:        "2026-04-01",
+		EndDate:          "2026-04-30",
+		BudgetMilliunits: 100_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ActualMilliunits != 70_000 {
+		t.Errorf("refund should offset purchase, expected 70_000 actual, got %d", out.ActualMilliunits)
+	}
+}
+
+func TestSpendingCheck_ExcludedPayeeFiltering(t *testing.T) {
+	t.Parallel()
+	// Two transactions, one from excluded payee — should be dropped from total.
+	client, _ := testClient(t, categoryTxnHandler(`{"data":{"server_knowledge":1,"transactions":[
+		{"id":"regular","type":"transaction","date":"2026-04-03","amount":-50000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p-wholefoods","payee_name":"Whole Foods","category_name":"Groceries","deleted":false},
+		{"id":"datenight","type":"transaction","date":"2026-04-06","amount":-40000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p-chipotle","payee_name":"Chipotle","category_name":"Groceries","deleted":false}
+	]}}`))
+	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
+		PlanID:           "p",
+		CategoryIDs:      []string{"cat"},
+		StartDate:        "2026-04-01",
+		EndDate:          "2026-04-30",
+		BudgetMilliunits: 100_000,
+		ExcludedPayeeIDs: []string{"p-chipotle"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the Whole Foods $50 should count, not the excluded Chipotle.
+	if out.ActualMilliunits != 50_000 {
+		t.Errorf("expected 50_000 after excluding Chipotle, got %d", out.ActualMilliunits)
+	}
+	if out.TransactionCount != 1 {
+		t.Errorf("expected 1 transaction after exclusion, got %d", out.TransactionCount)
+	}
+}
+
+func TestSpendingCheck_DateRangeRespectsEndDate(t *testing.T) {
+	t.Parallel()
+	// Transaction outside the end_date should be excluded.
+	client, _ := testClient(t, categoryTxnHandler(`{"data":{"server_knowledge":1,"transactions":[
+		{"id":"inside","type":"transaction","date":"2026-04-05","amount":-50000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false},
+		{"id":"outside","type":"transaction","date":"2026-04-30","amount":-100000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false}
+	]}}`))
+	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
+		PlanID:           "p",
+		CategoryIDs:      []string{"cat"},
+		StartDate:        "2026-04-01",
+		EndDate:          "2026-04-07",
+		BudgetMilliunits: 1_000_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ActualMilliunits != 50_000 {
+		t.Errorf("expected only 'inside' transaction to count (50_000), got %d", out.ActualMilliunits)
+	}
+}
+
+func TestSpendingCheck_InputValidation(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called on input validation failures")
+	})
+	cases := []struct {
+		name string
+		in   YnabSpendingCheckInput
+		want string
+	}{
+		{"no plan", YnabSpendingCheckInput{CategoryIDs: []string{"c"}, StartDate: "2026-04-01", EndDate: "2026-04-07"}, "plan_id"},
+		{"no categories", YnabSpendingCheckInput{PlanID: "p", StartDate: "2026-04-01", EndDate: "2026-04-07"}, "category_ids"},
+		{"no start", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, EndDate: "2026-04-07"}, "start_date"},
+		{"bad date", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, StartDate: "April 1", EndDate: "2026-04-07"}, "YYYY-MM-DD"},
+		{"inverted range", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, StartDate: "2026-04-15", EndDate: "2026-04-01"}, "on or after"},
+		{"negative budget", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, StartDate: "2026-04-01", EndDate: "2026-04-07", BudgetMilliunits: -1}, "non-negative"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, err := client.YnabSpendingCheck(context.Background(), nil, c.in)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("expected error containing %q, got %v", c.want, err)
+			}
+		})
+	}
+}
+
 func TestMonthlyInterestMilliunits(t *testing.T) {
 	t.Parallel()
 	// $1000 balance, 12% APR → $10/month interest.

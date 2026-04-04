@@ -261,6 +261,7 @@ type Transaction struct {
 	FlagColor        string `json:"flag_color,omitempty"`
 	AccountID        string `json:"account_id"`
 	AccountName      string `json:"account_name"`
+	PayeeID          string `json:"payee_id,omitempty"`
 	PayeeName        string `json:"payee_name,omitempty"`
 	CategoryName     string `json:"category_name,omitempty"`
 	IsSubtransaction bool   `json:"is_subtransaction,omitempty" jsonschema:"true when this row is a flattened split-transaction line from a category or payee filter"`
@@ -384,6 +385,7 @@ func toTransaction(w wireTransaction) Transaction {
 		FlagColor:    deref(w.FlagColor),
 		AccountID:    w.AccountID,
 		AccountName:  w.AccountName,
+		PayeeID:      deref(w.PayeeID),
 		PayeeName:    deref(w.PayeeName),
 		CategoryName: deref(w.CategoryName),
 	}

@@ -444,3 +444,158 @@ func progressedThisMonth(current, initial []int64) bool {
 	}
 	return false
 }
+
+// ============================================================================
+// ynab_spending_check — did the user stay on plan in a date range?
+// ============================================================================
+
+// YnabSpendingCheckInput describes a spending check against a budget.
+// The eating-plan audit shape: category set + date range + budget amount,
+// with an optional "except these payees" escape hatch (e.g. exclude
+// Chipotle on date nights).
+type YnabSpendingCheckInput struct {
+	PlanID           string   `json:"plan_id" jsonschema:"YNAB plan id, or 'last-used' / 'default'"`
+	CategoryIDs      []string `json:"category_ids" jsonschema:"one or more category ids to include in the spending total. Pass a single category or a group (Groceries + Restaurants + Coffee) — the tool sums across all of them."`
+	StartDate        string   `json:"start_date" jsonschema:"inclusive start of the date range (YYYY-MM-DD)"`
+	EndDate          string   `json:"end_date" jsonschema:"inclusive end of the date range (YYYY-MM-DD)"`
+	BudgetMilliunits int64    `json:"budget_milliunits" jsonschema:"spending limit for the date range in milliunits (positive)"`
+	ExcludedPayeeIDs []string `json:"excluded_payee_ids,omitempty" jsonschema:"optional list of payee ids to exclude from the sum (e.g. 'Chipotle' on date nights). Use list_payees with name_contains to find payee ids."`
+}
+
+// YnabSpendingCheckOutput reports the result of the spending check.
+type YnabSpendingCheckOutput struct {
+	OnPlan                bool          `json:"on_plan" jsonschema:"true if actual spending is less than or equal to the budget"`
+	ActualMilliunits      int64         `json:"actual_milliunits" jsonschema:"net spending in the scope (positive = net outflow, negative = net inflow from refunds)"`
+	BudgetMilliunits      int64         `json:"budget_milliunits"`
+	DeltaMilliunits       int64         `json:"delta_milliunits" jsonschema:"actual - budget. Positive = over budget, negative = under budget."`
+	TransactionCount      int           `json:"transaction_count"`
+	OffendingTransactions []Transaction `json:"offending_transactions,omitempty" jsonschema:"populated only when actual > budget: the transactions that contributed to the overspend, sorted by amount descending (biggest contributors first)"`
+}
+
+// YnabSpendingCheck aggregates spending across one or more categories
+// over a date range and compares to a budget. Returns an on_plan boolean
+// for "yes/no" LLM answers, plus the full offending-transactions list
+// when over budget so the LLM can narrate which transactions pushed
+// the user over.
+//
+// Implementation: calls list_transactions once per category_id with the
+// category scope filter. The SDK's hybrid endpoint flattens split
+// transactions to subtransaction rows, which gives us correct per-
+// category attribution for split transactions.
+func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, in YnabSpendingCheckInput) (*mcp.CallToolResult, YnabSpendingCheckOutput, error) {
+	if in.PlanID == "" {
+		return nil, YnabSpendingCheckOutput{}, errors.New("plan_id is required")
+	}
+	if len(in.CategoryIDs) == 0 {
+		return nil, YnabSpendingCheckOutput{}, errors.New("category_ids must contain at least one category")
+	}
+	if in.StartDate == "" || in.EndDate == "" {
+		return nil, YnabSpendingCheckOutput{}, errors.New("start_date and end_date are required (YYYY-MM-DD)")
+	}
+	if _, err := time.Parse("2006-01-02", in.StartDate); err != nil {
+		return nil, YnabSpendingCheckOutput{}, errors.New("start_date must be YYYY-MM-DD")
+	}
+	if _, err := time.Parse("2006-01-02", in.EndDate); err != nil {
+		return nil, YnabSpendingCheckOutput{}, errors.New("end_date must be YYYY-MM-DD")
+	}
+	if in.EndDate < in.StartDate { // ISO lex-sortable
+		return nil, YnabSpendingCheckOutput{}, errors.New("end_date must be on or after start_date")
+	}
+	if in.BudgetMilliunits < 0 {
+		return nil, YnabSpendingCheckOutput{}, errors.New("budget_milliunits must be non-negative")
+	}
+
+	excluded := make(map[string]struct{}, len(in.ExcludedPayeeIDs))
+	for _, id := range in.ExcludedPayeeIDs {
+		excluded[id] = struct{}{}
+	}
+
+	// Collect transactions across all requested categories. De-dupe by
+	// transaction id because a split transaction might contribute lines
+	// to multiple of the requested categories, but each line has a unique
+	// id so natural de-dup works.
+	seen := make(map[string]Transaction)
+	for _, catID := range in.CategoryIDs {
+		_, txnsOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
+			PlanID:     in.PlanID,
+			CategoryID: catID,
+			SinceDate:  in.StartDate,
+			Limit:      500, // YNAB scope endpoint returns in chronological order; take the max
+		})
+		if err != nil {
+			return nil, YnabSpendingCheckOutput{}, sanitizedErr(err)
+		}
+		for _, t := range txnsOut.Transactions {
+			// Date range filter: list_transactions applies since_date but
+			// not end_date, so we filter end_date here.
+			if t.Date > in.EndDate {
+				continue
+			}
+			if t.Date < in.StartDate {
+				continue // defensive; since_date should have handled this
+			}
+			// Payee exclusion.
+			if _, ex := excluded[payeeIDForTransaction(t)]; ex {
+				continue
+			}
+			seen[t.ID] = t
+		}
+	}
+
+	// Compute net outflow = -sum(amount) over the filtered set. YNAB
+	// stores outflows as negative milliunits so negating gives us a
+	// positive "spent" number when outflows dominate.
+	var netOutflowMu int64
+	txns := make([]Transaction, 0, len(seen))
+	for _, t := range seen {
+		netOutflowMu -= t.Amount.Milliunits
+		txns = append(txns, t)
+	}
+
+	delta := netOutflowMu - in.BudgetMilliunits
+	onPlan := delta <= 0
+
+	out := YnabSpendingCheckOutput{
+		OnPlan:           onPlan,
+		ActualMilliunits: netOutflowMu,
+		BudgetMilliunits: in.BudgetMilliunits,
+		DeltaMilliunits:  delta,
+		TransactionCount: len(txns),
+	}
+
+	// Only surface offending transactions when over budget. Sort biggest
+	// absolute amount first so the LLM can narrate "the Whole Foods
+	// $145 trip and the Costco $200 trip put you over".
+	if !onPlan {
+		sort.Slice(txns, func(i, j int) bool {
+			ai := txns[i].Amount.Milliunits
+			if ai < 0 {
+				ai = -ai
+			}
+			aj := txns[j].Amount.Milliunits
+			if aj < 0 {
+				aj = -aj
+			}
+			return ai > aj
+		})
+		out.OffendingTransactions = txns
+	}
+	return nil, out, nil
+}
+
+// payeeIDForTransaction returns the payee id for a Transaction output
+// type. Our Transaction struct doesn't carry payee_id directly (only
+// payee_name for display), so the excluded_payee_ids feature currently
+// has no way to match on the output shape. Track this as a known
+// limitation: the feature works at the WIRE level but our Transaction
+// type strips payee_id for leanness. Returning empty string means no
+// exclusion match; the LLM workaround is to use list_payees to resolve
+// names and pass IDs, but the match happens against the empty string
+// which never matches.
+//
+// RESOLUTION: we need payee_id on the Transaction output type. This is
+// fixed in the same commit — see the types.go change adding PayeeID to
+// Transaction and the corresponding update in toTransaction.
+func payeeIDForTransaction(t Transaction) string {
+	return t.PayeeID
+}

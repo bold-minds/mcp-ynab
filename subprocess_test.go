@@ -191,7 +191,8 @@ func TestSubprocess_InitializeAndListTools(t *testing.T) {
 		"list_scheduled_transactions": false,
 		"list_payees":                 false,
 		// Task-shaped tools (also read-only, ReadOnlyHint=true)
-		"ynab_debt_snapshot": false,
+		"ynab_debt_snapshot":  false,
+		"ynab_spending_check": false,
 	}
 	if len(tools) != len(want) {
 		t.Errorf("expected %d tools, got %d", len(want), len(tools))
