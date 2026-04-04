@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-04
+
+Major feature release. Adds write tools (opt-in), 5 task-shaped tools,
+delta sync, and a new `list_payees` read tool. Doubles the codebase
+test count from 49 to 160+. See [README.md](README.md) for the
+complete tool surface.
+
+### Added
+
+- **4 write tools, gated behind `YNAB_ALLOW_WRITES=1`:**
+  - `create_transaction` — posts a new transaction with optional `import_id` for idempotent retries. Asks the MCP client to confirm via elicitation before executing.
+  - `update_category_budgeted` — the primitive for Rule 3 money moves during the Sunday ritual. Returns before/after snapshots of budgeted and balance for the skill to persist an audit entry from.
+  - `update_transaction` — partial update of a transaction (category, payee, memo, approved, cleared, flag color). **Amount changes are structurally disallowed**: the input struct has no amount field, enforced by a reflection-based regression test.
+  - `approve_transaction` — convenience wrapper over `update_transaction` with `approved: true`. Deliberately **skips per-call elicitation** to support batch daily pending-cleanup workflows.
+- **5 task-shaped composition tools (read-only):**
+  - `ynab_status` — one-call Sunday ritual dashboard (Ready-to-Assign, overspent categories with credit card payment filtering, debt accounts with optional APR enrichment, savings accounts, days-since-last-reconciled, unapproved count, next-7-days scheduled cash flow with recurrence expansion).
+  - `ynab_spending_check` — "did I stay on plan?" with `excluded_payee_ids` for carve-outs.
+  - `ynab_weekly_checkin` — week-over-week income/outflow comparison plus month-over-month newly-overspent categories. Explicit `period_grouping_note` field communicates the mixed week/month scope.
+  - `ynab_debt_snapshot` — avalanche payoff simulation using integer basis-points arithmetic (no floats in the compounding loop). Structured negative-amortization error with shortfall amount when minimums can't cover interest.
+  - `ynab_waterfall_assignment` — **advisory-only** pure math over caller-supplied priority tiers with per-category `need_milliunits`. Issues no writes.
+- **`list_payees`** read tool with case-insensitive `name_contains` substring filter. Unblocks the `excluded_payee_ids` feature on `ynab_spending_check`.
+- **`recurrence.go`** — pure-function occurrence iterator for all 13 YNAB scheduled-transaction frequency enum values. One test per frequency, fail-closed on unknown values.
+- **Redacting `Token` type** already present from v0.1.0 extended to all new write paths via the shared `doJSONWithBody` helper in `client.go`.
+- **`docs/ASSUMPTIONS.md`** — new documentation file listing non-obvious assumptions about the YNAB API, notably the English-only "Credit Card Payments" group name match.
+
+### Changed
+
+- **Delta sync** for unfiltered `list_accounts` and `list_transactions`: in-process cache keyed by `(plan_id, endpoint)`, passes `last_knowledge_of_server` on subsequent calls and merges deltas including deletions. Scope limited to unfiltered endpoints per v0.2 brief decision.
+- **`Transaction` output type** gains `PayeeID` field so `ynab_spending_check`'s `excluded_payee_ids` has the data it needs to match.
+- **`Account` output type** gains `LastReconciledAt *time.Time` for the `ynab_status` days-since-last-reconciled computation.
+- `client.go:doJSON` is now a thin wrapper over `doJSONWithBody` so write and read paths share the same token injection, host lock, rate limiter, and error sanitization.
+
+### Security
+
+- **Write gate is bimodal**: without `YNAB_ALLOW_WRITES=1`, write tools are NOT REGISTERED at startup — they do not appear in `tools/list` and cannot be invoked at all. With the env var set, each handler also performs a per-call re-check as defense-in-depth.
+- **Universal amount safety cap**: writes with `|amount| > 10_000_000` milliunits (=$10K USD) require an `amount_override_milliunits` argument equal to the main amount as an explicit echo-back acknowledgment.
+- **MCP elicitation** per write call using the go-sdk's `ServerSession.Elicit` API (verified stable in v1.4.1). Graceful degradation: clients that don't support elicitation fall back to the env-var gate as the sole defense.
+- **Extended log-leak regression** (`TestLogLeak_PathologicalRoundTripper`) now covers all 12 currently-registered tools (8 reads + 4 writes) and also echoes the request body in its adversarial error to exercise the write payload path.
+- **New regression** (`TestLogLeak_WriteBodyNotEchoedInError`) documents the current sanitize() behavior for user-body content like transaction memos; flips visibly if future scrubbing rules change.
+- **Subprocess test** now covers both the env-unset path (writes not registered) and the env-set path (writes registered with `readOnlyHint: false`).
+
+### Known limitations
+
+Documented in README and [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md):
+
+- Delta sync only applies to **unfiltered** read endpoints. Filtered `list_transactions` (with `since_date`, `type`, or scope args) always does a full fetch. YNAB's delta semantics on filtered endpoints are under-documented.
+- Delta cache has **no TTL or size cap** in v0.2.0. Cache grows with session activity and dies with the process.
+- `ynab_status` credit-card filter matches on the English string `"Credit Card Payments"`. YNAB has been English-only for 15+ years; a future localization would require updating `ynabStatusCreditCardPaymentGroupName` in `tools_tasks.go`.
+- `twiceAMonth` scheduled frequency is approximated as 15-day advance in the recurrence iterator because YNAB's API doesn't expose the user's two anchor days.
+- Amount safety cap is currency-agnostic at 10M milliunits. Correct for USD; tighter than intended for plans with very different subunit scales.
+
 ## [0.1.0] — 2026-04-04
 
 Initial release. Read-only MCP server for the YNAB budgeting API.
@@ -37,5 +88,6 @@ Initial release. Read-only MCP server for the YNAB budgeting API.
 - Regression test `TestLogLeak_PathologicalRoundTripper` verifies that a misbehaving inner HTTP transport that embeds the bearer token literally in its error string produces no token leakage through any of the 7 tool handlers.
 - Subprocess test `TestSubprocess_SDKValidatesMissingRequiredArg` verifies that the MCP SDK rejects tool calls with missing required arguments at the protocol layer (JSON-RPC `-32602`), before any handler code runs.
 
-[Unreleased]: https://github.com/bold-minds/mcp-ynab/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bold-minds/mcp-ynab/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bold-minds/mcp-ynab/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bold-minds/mcp-ynab/releases/tag/v0.1.0

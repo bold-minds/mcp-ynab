@@ -18,17 +18,45 @@ YNAB personal access tokens are long-lived and full-scope — they grant read *a
 
 ## Tools
 
+### Read tools (always available)
+
 | Tool                          | Description                                                                                                   |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `list_plans`                  | List all YNAB plans (called "budgets" in the YNAB UI) owned by the authenticated user.                        |
-| `list_accounts`               | List accounts in a plan with current balances. Closed accounts are excluded by default.                       |
+| `list_accounts`               | List accounts in a plan with current balances. Closed accounts excluded by default. Delta-synced. |
 | `list_categories`             | List all categories in a plan with this month's assigned / activity / balance amounts and goal details.      |
-| `list_transactions`           | List transactions for a plan, most recent first. Filter by `since_date`, approval state (`type`), or scope — **one of** `account_id`, `category_id`, or `payee_id`. Category / payee scoping flattens split transactions so each subtransaction line appears separately with `is_subtransaction: true`. Default limit 100, max 500. |
+| `list_transactions`           | List transactions for a plan, most recent first. Filter by `since_date`, approval state (`type`), or scope — **one of** `account_id`, `category_id`, or `payee_id`. Unfiltered variant is delta-synced. Category / payee scoping flattens split transactions. Default limit 100, max 500. |
 | `list_months`                 | Monthly rollup summaries (income, budgeted, activity, to_be_budgeted, age_of_money) for recent months, most recent first. Use for month-over-month trends. Default limit 6, max 60. |
 | `get_month`                   | Full plan month with per-category breakdown. Accepts `"current"` or `YYYY-MM-01`. Use for the Sunday ritual / True Expenses check.|
 | `list_scheduled_transactions` | Recurring and future-dated scheduled transactions in date_next order (soonest first). Optional `upcoming_days` filter.|
+| `list_payees`                 | List payees in a plan. Optional `name_contains` performs a case-insensitive substring match — use to resolve payee names to IDs before calling `list_transactions` with `payee_id` or `ynab_spending_check` with `excluded_payee_ids`. |
 
-All tools advertise `readOnlyHint: true` in their MCP annotations.
+### Task-shaped tools (composition over primitives)
+
+| Tool                          | Description                                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `ynab_status`                 | One-call Sunday ritual dashboard: Ready-to-Assign, overspent categories (with credit card payment categories excluded), debt accounts with optional APR enrichment, savings accounts, days-since-last-reconciled per account, unapproved count, and next-7-days scheduled cash flow with recurrence expansion. |
+| `ynab_spending_check`         | "Did I stay under $500 on groceries this week?" Sums net outflow across one or more categories over a date range, compares to a budget, returns `on_plan` verdict and offending transactions when over budget. Supports `excluded_payee_ids` for carve-outs like "except Chipotle on date nights". |
+| `ynab_weekly_checkin`         | Week-over-week comparison of income, outflows, and unapproved count, plus month-over-month newly-overspent categories and age-of-money delta. |
+| `ynab_debt_snapshot`          | Current debt balances + avalanche payoff projection. Integer basis-points simulation, no floats in the compounding loop. Optional `extra_per_month_milliunits` runs a comparison scenario. Returns structured negative-amortization error with shortfall amount when minimums can't cover interest. |
+| `ynab_waterfall_assignment`   | **Advisory, no writes.** Walks a priority waterfall given per-category `need_milliunits` the skill has computed, returns proposed allocations and remainder. The LLM presents the plan; if approved, issues `update_category_budgeted` calls separately. |
+
+### Write tools (opt-in, require `YNAB_ALLOW_WRITES=1`)
+
+Write tools are **not registered at startup** unless `YNAB_ALLOW_WRITES=1` is set in the MCP server's environment. When disabled, they do not appear in `tools/list` and cannot be called at all.
+
+| Tool                          | Description                                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `create_transaction`          | Create a new transaction. Asks the MCP client to confirm via elicitation. Amounts > $10K require an `amount_override_milliunits` echo-back acknowledgment. Provide an `import_id` to dedupe idempotently on retry. |
+| `update_category_budgeted`    | Change the assigned amount on a single category for a single plan month. The primitive for Rule 3 money moves during the Sunday ritual. Returns before/after snapshots of budgeted and balance. |
+| `update_transaction`          | Partial update of a transaction: category, payee, memo, approved state, cleared state, flag color. **Amount changes are structurally not supported** — the input struct has no amount field, enforced by a reflection regression test. |
+| `approve_transaction`         | Convenience wrapper setting `approved=true` on a transaction. **Skips per-call elicitation** to support batch daily pending-cleanup workflows. The `YNAB_ALLOW_WRITES=1` env-var gate remains the primary defense. |
+
+All read and task-shaped tools advertise `readOnlyHint: true` in their MCP annotations. Write tools advertise `readOnlyHint: false`.
+
+**Tool counts:**
+- Without `YNAB_ALLOW_WRITES`: **13 tools** (8 reads + 5 task-shaped)
+- With `YNAB_ALLOW_WRITES=1`: **17 tools** (add 4 writes)
 
 ### What each tool enables
 
@@ -182,7 +210,9 @@ Any client that speaks the MCP stdio transport can launch `mcp-ynab` as a subpro
 | Token leakage via HTTP-client errors (axios-style config-in-error pattern)  | Adversarial regression test: pathological RoundTripper returns errors containing the literal token; every tool's error path is asserted not to echo it.  |
 | Exfiltration of the YNAB token via a rogue URL (SSRF / spec injection)       | Custom `http.RoundTripper` refuses any request whose hostname is not `api.ynab.com` (case-insensitive, port-tolerant). Strips `Authorization` defensively. Refuses all redirects. |
 | Token leakage via YNAB error responses surfaced to the LLM                  | All YNAB errors go through `sanitize()`, which strips `Bearer <token>` and `Authorization:` patterns. No code path formats the raw token into an error.  |
-| Runaway LLM exhausting YNAB's per-token rate limit (200 req/hour)            | Token-bucket rate limiter at **180 req/hour** (1 per 20 seconds, burst of 10). Enforced in the RoundTripper.                                              |
+| Runaway LLM exhausting YNAB's per-token rate limit (200 req/hour)            | Token-bucket rate limiter: 1 request per 20 seconds refill rate with a burst of 10 (max 190 calls/hour steady-state). Enforced in the RoundTripper.        |
+| Unbounded write access by an LLM with credentials                            | **Write tools are opt-in.** Unless `YNAB_ALLOW_WRITES=1` is set at MCP server startup, write tools are not registered at all and cannot be invoked. When writes are enabled, every write goes through an MCP elicitation confirmation, an amount safety cap with echo-back override for >$10K transactions, and returns before/after state in the response so the calling skill can persist an audit record. |
+| Wrong-amount updates on existing transactions                                | `update_transaction` has no amount field on its input struct — amount changes are structurally impossible via this tool. Regression test enforces the field's absence via reflection.                                                    |
 | Hung upstream                                                                | 30-second per-request timeout, 8 MB response body cap.                                                                                                    |
 | Plaintext token storage                                                      | OS keyring is the recommended storage path; file-based and env-var are fallbacks documented with tradeoffs.                                                |
 | Inbound network attack on the server                                         | stdio transport only — no listening socket, no HTTP endpoints.                                                                                             |
@@ -203,14 +233,46 @@ Any client that speaks the MCP stdio transport can launch `mcp-ynab` as a subpro
 - An adversarial user on your own machine with read access to your keyring / token file.
 - The bare token value appearing in a YNAB error response body as a non-`Bearer`-prefixed substring (unlikely in practice).
 
+## Enabling writes
+
+By default, `mcp-ynab` is read-only. To enable write tools, set `YNAB_ALLOW_WRITES=1` in the MCP server's environment:
+
+```json
+{
+  "mcpServers": {
+    "ynab": {
+      "command": "mcp-ynab",
+      "env": {
+        "YNAB_ALLOW_WRITES": "1"
+      }
+    }
+  }
+}
+```
+
+When writes are enabled:
+- The 4 write tools appear in `tools/list` alongside the 13 read and task-shaped tools.
+- Every write goes through an MCP elicitation confirmation prompt (on clients that support it — Claude Code does, Claude Desktop does not; the env-var gate is the sole defense on clients without elicitation).
+- Amounts > $10,000 milliunits require an `amount_override_milliunits` parameter equal to the main amount, forcing the LLM to explicitly re-assert the value.
+- Every write returns before/after state in its response; the calling skill is responsible for persisting an audit trail from those responses (the MCP itself writes no logs to disk).
+
+## Known limitations
+
+- **Delta sync is unfiltered-only.** `list_accounts` and unfiltered `list_transactions` use `last_knowledge_of_server` for bandwidth savings. Filtered `list_transactions` (with `since_date`, `type`, or scope) always does a full fetch — YNAB's delta semantics on filtered endpoints are under-documented.
+- **Delta cache has no TTL or size cap** in v0.2.0. For single-session MCP processes (minutes to hours) this is fine; for long-running daemons it grows unbounded. See `delta.go` for the memory profile discussion.
+- **English-only** assumptions — see [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md) for the full list, notably the "Credit Card Payments" group name match in `ynab_status`.
+- **`twiceAMonth` schedules** are approximated as 15-day advances in the recurrence iterator because YNAB's API doesn't expose the user's two anchor days. For 7-day dashboard windows this under-counts by at most one occurrence. See [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md).
+- **Amount cap is currency-agnostic** at 10 million milliunits. Correct for USD ($10K); tighter than intended for currencies with different subunit scales (e.g., JPY ~$70 USD equivalent).
+
 ## Roadmap
 
-Deferred from v0.1 with explicit rationale:
+Deferred from v0.2:
 
-- **Delta sync (`last_knowledge_of_server`)** — YNAB supports it on `/plans` and related endpoints. A full implementation would need stateful in-memory caching keyed by `(plan_id, endpoint)` and delta-merge logic. Not a security concern: every call is still 1 HTTP request whether delta sync is used or not — the benefit is smaller responses and less bandwidth, not fewer requests. Punted until the rate limiter is actually a bottleneck in practice.
-- **Task-shaped tools** (`ynab_status`, `ynab_spending_check`, `ynab_weekly_checkin`) — a more LLM-friendly surface composed on top of the current API-shaped primitives. v0.1 ships with 7 API-shaped read tools; task-shaped tools can be added in v0.2 without breaking changes.
-- **APR storage for debt projections** — YNAB does not track APRs. A config-file sidecar mapping `account_id → apr` would enable payoff projections. Not in v0.1; belongs with task-shaped tools.
-- **Write tools** (`create_transaction`, `update_category_budgeted`, `approve_transaction`) — will ship in v0.2+ behind an explicit opt-in (`YNAB_ALLOW_WRITES=1`) with per-call confirmation via MCP elicitation and bounded amounts. Covers "log this coffee", Rule 3 money moves, and daily pending-transaction cleanup.
+- **Currency-aware amount caps** — fetch the plan's `currency_format.iso_code` and use a per-currency threshold table.
+- **Bounded delta cache** — LRU eviction or time-based TTL once long-running session patterns reveal whether it matters.
+- **`twiceAMonth` accurate expansion** — use `date_first` and `date_next` to derive the two anchor days per month.
+- **Delta sync for filtered reads** — once YNAB's documentation clarifies the semantics with query filters.
+- **Write tool: `delete_transaction`** — highest-risk write, not shipping until there is a strong user case.
 
 ## Development
 

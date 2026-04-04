@@ -36,6 +36,11 @@ Issues that affect the confidentiality, integrity, or availability of a user's Y
 - **SSRF** via a tool argument, a YNAB response field, or the OpenAPI spec supply chain.
 - **Rate-limit bypass** that could be used to exhaust a user's 200/hr YNAB quota.
 - **Input-validation bypass** that allows an LLM-supplied argument to trigger behavior outside the declared tool contract (including path traversal in `plan_id`, injection into query params, integer overflow in amount formatting).
+- **Write gate bypass** (v0.2+): any way to invoke write tools (`create_transaction`, `update_category_budgeted`, `update_transaction`, `approve_transaction`) without `YNAB_ALLOW_WRITES=1`, or any way to issue writes to YNAB without going through a registered handler.
+- **Amount safety bypass** (v0.2+): any way to submit a write with `|amount| > 10_000_000` milliunits without a matching `amount_override_milliunits` echo-back.
+- **Structural amount immutability bypass** (v0.2+): any way to change a transaction's amount via `update_transaction`. The input struct has no amount field, enforced by a reflection-based regression test.
+- **Elicitation bypass** (v0.2+): any way to have a write handler proceed past `elicitConfirmation` when the MCP client has declined or cancelled the confirmation prompt.
+- **Request body leakage in write error paths** (v0.2+): any way for a user-submitted transaction memo or other body content to be echoed back to the MCP client through an error surface.
 - **Dependency vulnerabilities** that are actually reachable from our code.
 - **Supply chain** — typosquatted deps, unpinned transitive deps, compromised release artifacts.
 
