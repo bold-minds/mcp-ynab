@@ -274,6 +274,8 @@ func TestSubprocess_WritesRegisteredWhenGateOn(t *testing.T) {
 	expectedWrites := map[string]bool{
 		"create_transaction":       false,
 		"update_category_budgeted": false,
+		"update_transaction":       false,
+		"approve_transaction":      false,
 	}
 	for _, ti := range tools {
 		tm := ti.(map[string]any)

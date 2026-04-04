@@ -461,6 +461,24 @@ func registerTools(server *mcp.Server, c *Client) {
 			Description: "Change the assigned (budgeted) amount on a single category for a single plan month. Primitive for Rule 3 money moves during the Sunday ritual. Requires YNAB_ALLOW_WRITES=1. Asks the MCP client to confirm before executing, showing the before/after delta. Returns before and after snapshots of budgeted and balance.",
 			Annotations: mutatingBudget,
 		}, c.UpdateCategoryBudgeted)
+
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "update_transaction",
+			Title:       "Update transaction",
+			Description: "Update a partial subset of fields on an existing transaction: category, payee, memo, approved state, cleared state, flag color. Amount changes are NOT supported — users who need to change an amount should delete the transaction in the YNAB app and create a new one. At least one mutable field must be specified. Requires YNAB_ALLOW_WRITES=1 and asks the MCP client to confirm before executing.",
+			Annotations: mutatingBudget,
+		}, c.UpdateTransaction)
+
+		// approve_transaction deliberately skips elicitation (see its doc
+		// comment in tools_writes.go) to support batch pending-cleanup
+		// workflows. Mark idempotent — approving an already-approved
+		// transaction is a no-op at YNAB's end.
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "approve_transaction",
+			Title:       "Approve transaction",
+			Description: "Mark an existing transaction as approved. Convenience wrapper over update_transaction. Does NOT prompt for per-call confirmation (unlike other write tools) to support batch daily-cleanup workflows — the YNAB_ALLOW_WRITES=1 env var remains the primary defense. Returns before/after snapshot of the approved field.",
+			Annotations: mutatingBudget,
+		}, c.ApproveTransaction)
 	}
 }
 

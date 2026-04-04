@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -321,6 +322,209 @@ func TestUpdateCategoryBudgeted_AmountBound(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "amount_override_milliunits") {
 		t.Errorf("expected amount bound error, got %v", err)
+	}
+}
+
+// ---- update_transaction ----------------------------------------------------
+
+func TestUpdateTransaction_GateOff(t *testing.T) {
+	t.Setenv(envAllowWrites, "")
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called when gate is off")
+	})
+	memo := "new memo"
+	_, _, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
+		PlanID: "p", TransactionID: "t", Memo: &memo,
+	})
+	if err == nil || !strings.Contains(err.Error(), "YNAB_ALLOW_WRITES") {
+		t.Errorf("expected gate error, got %v", err)
+	}
+}
+
+func TestUpdateTransaction_RequiresAtLeastOneMutableField(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called")
+	})
+	_, _, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
+		PlanID: "p", TransactionID: "t",
+	})
+	if err == nil || !strings.Contains(err.Error(), "at least one field") {
+		t.Errorf("expected no-op error, got %v", err)
+	}
+}
+
+func TestUpdateTransaction_InputHasNoAmountField(t *testing.T) {
+	// This is the structural regression test for "amount updates are not
+	// permitted through this tool". Use reflection to confirm the input
+	// struct has no field named Amount or AmountMilliunits.
+	t.Parallel()
+	typ := reflect.TypeOf(UpdateTransactionInput{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		name := strings.ToLower(f.Name)
+		if strings.Contains(name, "amount") {
+			t.Errorf("UpdateTransactionInput has disallowed field %q — amount changes are not supported via update_transaction", f.Name)
+		}
+	}
+}
+
+func TestUpdateTransaction_HappyPathSingleField(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	var putBody map[string]any
+	var seenMethods []string
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		seenMethods = append(seenMethods, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			// Before-state fetch
+			_, _ = w.Write([]byte(`{"data":{"transaction":{
+				"id":"t1","date":"2026-04-05","amount":-5000,
+				"memo":"old memo","cleared":"uncleared","approved":false,
+				"account_id":"a","account_name":"Checking",
+				"payee_name":"Target","category_name":"Shopping","deleted":false
+			}}}`))
+		case http.MethodPut:
+			_ = json.NewDecoder(r.Body).Decode(&putBody)
+			// After-state from server
+			_, _ = w.Write([]byte(`{"data":{"transaction":{
+				"id":"t1","date":"2026-04-05","amount":-5000,
+				"memo":"new memo","cleared":"uncleared","approved":false,
+				"account_id":"a","account_name":"Checking",
+				"payee_name":"Target","category_name":"Shopping","deleted":false
+			}}}`))
+		}
+	})
+	newMemo := "new memo"
+	_, out, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
+		PlanID: "plan-1", TransactionID: "t1", Memo: &newMemo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seenMethods) != 2 || seenMethods[0] != "GET" || seenMethods[1] != "PUT" {
+		t.Errorf("expected GET then PUT, got %v", seenMethods)
+	}
+	// PUT body should have ONLY the memo field inside transaction, no amount.
+	txn, _ := putBody["transaction"].(map[string]any)
+	if _, hasAmount := txn["amount"]; hasAmount {
+		t.Error("PUT body must NOT include amount field")
+	}
+	if txn["memo"] != "new memo" {
+		t.Errorf("expected memo in PUT body, got %+v", txn)
+	}
+	// Before/after snapshots should contain ONLY the memo field.
+	if out.Before.Memo == nil || *out.Before.Memo != "old memo" {
+		t.Errorf("wrong before memo: %+v", out.Before)
+	}
+	if out.After.Memo == nil || *out.After.Memo != "new memo" {
+		t.Errorf("wrong after memo: %+v", out.After)
+	}
+	// Other fields not touched should be nil in the snapshots.
+	if out.Before.CategoryID != nil || out.Before.Approved != nil {
+		t.Errorf("snapshot should only contain touched fields, got before=%+v", out.Before)
+	}
+}
+
+func TestUpdateTransaction_LengthAndEnumValidation(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called")
+	})
+	tooLong := strings.Repeat("x", 201)
+	tooLongMemo := strings.Repeat("x", 501)
+	badCleared := "done"
+	badFlag := "chartreuse"
+
+	cases := []struct {
+		name string
+		in   UpdateTransactionInput
+		want string
+	}{
+		{"payee_name > 200", UpdateTransactionInput{PlanID: "p", TransactionID: "t", PayeeName: &tooLong}, "200"},
+		{"memo > 500", UpdateTransactionInput{PlanID: "p", TransactionID: "t", Memo: &tooLongMemo}, "500"},
+		{"bad cleared", UpdateTransactionInput{PlanID: "p", TransactionID: "t", Cleared: &badCleared}, "cleared"},
+		{"bad flag", UpdateTransactionInput{PlanID: "p", TransactionID: "t", FlagColor: &badFlag}, "flag_color"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, err := client.UpdateTransaction(context.Background(), emptyReq(), c.in)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("expected error containing %q, got %v", c.want, err)
+			}
+		})
+	}
+}
+
+// ---- approve_transaction ---------------------------------------------------
+
+func TestApproveTransaction_HappyPathNoElicit(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	var putBody map[string]any
+	var methods []string
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte(`{"data":{"transaction":{
+				"id":"t1","date":"2026-04-05","amount":-1000,"memo":null,
+				"cleared":"uncleared","approved":false,
+				"account_id":"a","account_name":"Checking","deleted":false
+			}}}`))
+		case http.MethodPut:
+			_ = json.NewDecoder(r.Body).Decode(&putBody)
+			_, _ = w.Write([]byte(`{"data":{"transaction":{
+				"id":"t1","date":"2026-04-05","amount":-1000,"memo":null,
+				"cleared":"uncleared","approved":true,
+				"account_id":"a","account_name":"Checking","deleted":false
+			}}}`))
+		}
+	})
+	_, out, err := client.ApproveTransaction(context.Background(), emptyReq(), ApproveTransactionInput{
+		PlanID: "plan-1", TransactionID: "t1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(methods) != 2 || methods[1] != "PUT" {
+		t.Errorf("wrong requests: %v", methods)
+	}
+	// Body must contain approved=true and NO other fields (except what our
+	// omitempty marshaling decides on nil pointers).
+	txn := putBody["transaction"].(map[string]any)
+	if txn["approved"] != true {
+		t.Errorf("expected approved=true in PUT body, got %+v", txn)
+	}
+	// Should not include any other write fields.
+	for _, k := range []string{"memo", "category_id", "payee_id", "payee_name", "cleared", "flag_color"} {
+		if _, present := txn[k]; present {
+			t.Errorf("PUT body should not include %q, got %+v", k, txn)
+		}
+	}
+	// Before/after should show only the approved flip.
+	if out.Before.Approved == nil || *out.Before.Approved != false {
+		t.Errorf("before approved should be false, got %+v", out.Before)
+	}
+	if out.After.Approved == nil || *out.After.Approved != true {
+		t.Errorf("after approved should be true, got %+v", out.After)
+	}
+	if out.Before.Memo != nil || out.After.Memo != nil {
+		t.Errorf("unchanged fields should be nil in snapshots")
+	}
+}
+
+func TestApproveTransaction_GateOff(t *testing.T) {
+	t.Setenv(envAllowWrites, "")
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called when gate is off")
+	})
+	_, _, err := client.ApproveTransaction(context.Background(), emptyReq(), ApproveTransactionInput{
+		PlanID: "p", TransactionID: "t",
+	})
+	if err == nil || !strings.Contains(err.Error(), "YNAB_ALLOW_WRITES") {
+		t.Errorf("expected gate error, got %v", err)
 	}
 }
 
