@@ -86,8 +86,8 @@ func TestGetMonth_DefaultsToCurrent(t *testing.T) {
 	assertMoney(t, "Budgeted", out.Budgeted, 4500000, "4500.000")
 	assertMoney(t, "Activity", out.Activity, -2000000, "-2000.000")
 	assertMoney(t, "ToBeBudgeted", out.ToBeBudgeted, 500000, "500.000")
-	if out.AgeOfMoney != 42 {
-		t.Errorf("age of money wrong: %d", out.AgeOfMoney)
+	if out.AgeOfMoney == nil || *out.AgeOfMoney != 42 {
+		t.Errorf("age of money wrong: %v", out.AgeOfMoney)
 	}
 }
 

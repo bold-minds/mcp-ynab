@@ -273,6 +273,10 @@ type Transaction struct {
 
 // MonthSummary is a lean per-month rollup used by list_months. It intentionally
 // omits the per-category breakdown — use get_month when you need that level.
+//
+// AgeOfMoney is a pointer so that a legitimate age_of_money=0 (new plan,
+// rebuilt plan) is distinguishable from "YNAB returned null" at this field.
+// Review finding B3/M3.
 type MonthSummary struct {
 	Month        string `json:"month" jsonschema:"the month in YYYY-MM-01 format"`
 	Note         string `json:"note,omitempty"`
@@ -280,7 +284,7 @@ type MonthSummary struct {
 	Budgeted     Money  `json:"budgeted"`
 	Activity     Money  `json:"activity"`
 	ToBeBudgeted Money  `json:"to_be_budgeted"`
-	AgeOfMoney   int    `json:"age_of_money,omitempty"`
+	AgeOfMoney   *int   `json:"age_of_money,omitempty"`
 }
 
 // Payee is a YNAB payee as returned by list_payees.
@@ -307,6 +311,12 @@ type ScheduledTransaction struct {
 }
 
 // Month is the detail view of a plan month.
+//
+// AgeOfMoney is a pointer to preserve the null-vs-zero distinction from
+// YNAB's wire format. A brand-new or rebuilt plan legitimately has
+// age_of_money=0; without nullability, ynab_weekly_checkin can't tell
+// that case apart from "YNAB hasn't computed it yet" and would silently
+// suppress the delta. Review finding B3/M3.
 type Month struct {
 	Month        string     `json:"month" jsonschema:"the month in YYYY-MM-01 format"`
 	Note         string     `json:"note,omitempty"`
@@ -314,7 +324,7 @@ type Month struct {
 	Budgeted     Money      `json:"budgeted" jsonschema:"total amount assigned in the month"`
 	Activity     Money      `json:"activity" jsonschema:"total transaction activity excluding Ready-to-Assign inflows"`
 	ToBeBudgeted Money      `json:"to_be_budgeted" jsonschema:"amount still available for Ready-to-Assign"`
-	AgeOfMoney   int        `json:"age_of_money,omitempty"`
+	AgeOfMoney   *int       `json:"age_of_money,omitempty"`
 	Categories   []Category `json:"categories"`
 }
 
@@ -410,18 +420,15 @@ func toTransactionFromHybrid(w wireHybridTransaction) Transaction {
 }
 
 func toMonthSummary(w wireMonthSummary) MonthSummary {
-	out := MonthSummary{
+	return MonthSummary{
 		Month:        w.Month,
 		Note:         deref(w.Note),
 		Income:       NewMoney(w.Income),
 		Budgeted:     NewMoney(w.Budgeted),
 		Activity:     NewMoney(w.Activity),
 		ToBeBudgeted: NewMoney(w.ToBeBudgeted),
+		AgeOfMoney:   w.AgeOfMoney, // passthrough preserves null vs 0
 	}
-	if w.AgeOfMoney != nil {
-		out.AgeOfMoney = *w.AgeOfMoney
-	}
-	return out
 }
 
 func toPayee(w wirePayee) Payee {
@@ -456,19 +463,16 @@ func toMonth(w wireMonthDetail) Month {
 		}
 		cats = append(cats, toCategory(c))
 	}
-	out := Month{
+	return Month{
 		Month:        w.Month,
 		Note:         deref(w.Note),
 		Income:       NewMoney(w.Income),
 		Budgeted:     NewMoney(w.Budgeted),
 		Activity:     NewMoney(w.Activity),
 		ToBeBudgeted: NewMoney(w.ToBeBudgeted),
+		AgeOfMoney:   w.AgeOfMoney, // passthrough preserves null vs 0
 		Categories:   cats,
 	}
-	if w.AgeOfMoney != nil {
-		out.AgeOfMoney = *w.AgeOfMoney
-	}
-	return out
 }
 
 func deref(s *string) string {

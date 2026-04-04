@@ -1197,6 +1197,88 @@ func TestCountUnapprovedExcludingTransferMirrors(t *testing.T) {
 	}
 }
 
+// TestWeeklyCheckin_AgeOfMoneyDeltaDistinguishesZeroFromNull is the
+// B3/M3 regression. A legitimate age_of_money=0 (new plan) must produce
+// a real delta, not be silently dropped. Conversely, age_of_money=null
+// on either side must leave the delta nil.
+func TestWeeklyCheckin_AgeOfMoneyDeltaDistinguishesZeroFromNull(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		curJSON   string
+		priorJSON string
+		wantNil   bool
+		wantDelta int
+	}{
+		{
+			name:      "both zero — delta is 0 (not nil)",
+			curJSON:   `0`,
+			priorJSON: `0`,
+			wantNil:   false,
+			wantDelta: 0,
+		},
+		{
+			name:      "both present and non-zero — normal delta",
+			curJSON:   `40`,
+			priorJSON: `35`,
+			wantNil:   false,
+			wantDelta: 5,
+		},
+		{
+			name:      "current null — delta nil",
+			curJSON:   `null`,
+			priorJSON: `35`,
+			wantNil:   true,
+		},
+		{
+			name:      "prior null — delta nil",
+			curJSON:   `40`,
+			priorJSON: `null`,
+			wantNil:   true,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/transactions") && r.URL.Query().Get("type") == "unapproved":
+					_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[]}}`))
+				case strings.HasSuffix(r.URL.Path, "/transactions"):
+					_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[]}}`))
+				case strings.Contains(r.URL.Path, "/months/2026-04-01"):
+					_, _ = w.Write([]byte(`{"data":{"month":{"month":"2026-04-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,"age_of_money":` + tc.curJSON + `,"categories":[]}}}`))
+				case strings.Contains(r.URL.Path, "/months/2026-03-01"):
+					_, _ = w.Write([]byte(`{"data":{"month":{"month":"2026-03-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,"age_of_money":` + tc.priorJSON + `,"categories":[]}}}`))
+				default:
+					http.Error(w, "unexpected URL: "+r.URL.Path, http.StatusNotFound)
+				}
+			}
+			client, _ := testClient(t, handler)
+			_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
+				PlanID: "p", AsOfDate: "2026-04-14",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantNil {
+				if out.AgeOfMoneyDeltaDays != nil {
+					t.Errorf("expected nil delta, got %d", *out.AgeOfMoneyDeltaDays)
+				}
+				return
+			}
+			if out.AgeOfMoneyDeltaDays == nil {
+				t.Fatalf("expected non-nil delta of %d, got nil", tc.wantDelta)
+			}
+			if *out.AgeOfMoneyDeltaDays != tc.wantDelta {
+				t.Errorf("expected delta %d, got %d", tc.wantDelta, *out.AgeOfMoneyDeltaDays)
+			}
+		})
+	}
+}
+
 func TestWeeklyCheckin_CategoryResolvedFromOverspent(t *testing.T) {
 	t.Parallel()
 	// Prior month: Groceries was overspent. Current month: still -30000

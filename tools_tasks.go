@@ -995,10 +995,11 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 		}
 	}
 
-	// age_of_money delta (month-granular; explicitly null if either
-	// month's value isn't available).
-	if curMonthOut.AgeOfMoney != 0 && priorMonthOut.AgeOfMoney != 0 {
-		delta := curMonthOut.AgeOfMoney - priorMonthOut.AgeOfMoney
+	// age_of_money delta (month-granular; nil if either month's value
+	// isn't available). Uses *int comparison so legitimate zeros are
+	// distinguishable from "YNAB returned null" — review finding B3/M3.
+	if curMonthOut.AgeOfMoney != nil && priorMonthOut.AgeOfMoney != nil {
+		delta := *curMonthOut.AgeOfMoney - *priorMonthOut.AgeOfMoney
 		out.AgeOfMoneyDeltaDays = &delta
 	}
 
