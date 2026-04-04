@@ -1,0 +1,101 @@
+name: Bug report
+description: Something is broken, wrong, or misbehaving
+title: "bug: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **For security issues, do NOT use this form** — please use [GitHub Security Advisories](https://github.com/bold-minds/mcp-ynab/security/advisories/new) instead. See [SECURITY.md](https://github.com/bold-minds/mcp-ynab/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A clear, one-sentence description of what is wrong.
+      placeholder: "list_transactions returns duplicate rows when filtering by category_id"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: |
+        Exact steps to reproduce. Include the MCP tool call (arguments), the expected result, and the actual result.
+      placeholder: |
+        1. Call `list_transactions` with `{"plan_id": "...", "category_id": "..."}`
+        2. Expected: each transaction appears once
+        3. Actual: split transactions appear twice
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: mcp-ynab version
+      description: Output of `mcp-ynab version`
+      placeholder: "v0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: Output of `go version` (only if you built from source)
+      placeholder: "go1.25.2 linux/amd64"
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.2 / Ubuntu 24.04 / Windows 11"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mcp-client
+    attributes:
+      label: MCP client
+      options:
+        - Claude Desktop
+        - Cursor
+        - pocketcrew
+        - Other (specify in Additional context)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: token-source
+    attributes:
+      label: Token source
+      description: How is the YNAB token provided to the server?
+      options:
+        - OS keyring (store-token)
+        - YNAB_API_TOKEN_FILE
+        - YNAB_API_TOKEN environment variable
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output (stderr)
+      description: |
+        Paste any relevant output the server wrote to stderr. **Before pasting, grep for "sk-" or "Bearer" and redact any token values** — tokens should already be `[REDACTED]` in this server's output, but verify before sharing.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help — screenshots, related issues, recent changes.
+    validations:
+      required: false

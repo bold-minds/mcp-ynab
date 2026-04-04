@@ -1,0 +1,11 @@
+/mcp-ynab
+/dist/
+*.test
+coverage.out
+coverage.html
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
