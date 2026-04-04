@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,12 +147,31 @@ func (c *Client) ListAccounts(ctx context.Context, _ *mcp.CallToolRequest, in Li
 		return nil, ListAccountsOutput{}, errors.New("plan_id is required")
 	}
 	path := "/plans/" + url.PathEscape(in.PlanID) + "/accounts"
+
+	// Delta sync: if we have cached server_knowledge for this plan, pass
+	// it to YNAB and merge the deltas into the cached set. The deltaCache
+	// is nil-safe: tests that don't want caching construct Clients with
+	// nil caches and the code below degrades to full-fetch.
+	q := url.Values{}
+	if k := c.accountsDelta.knowledge(in.PlanID); k > 0 {
+		q.Set("last_knowledge_of_server", strconv.FormatInt(k, 10))
+	}
 	var wire wireAccountsResponse
-	if err := c.doJSON(ctx, path, nil, &wire); err != nil {
+	if err := c.doJSON(ctx, path, q, &wire); err != nil {
 		return nil, ListAccountsOutput{}, sanitizedErr(err)
 	}
-	accounts := make([]Account, 0, len(wire.Data.Accounts))
-	for _, a := range wire.Data.Accounts {
+	// Merge: returns the complete cached set (first call) or the merged
+	// cached+deltas set (subsequent calls). When the cache is nil, merge
+	// returns the deltas unchanged (full-fetch semantics).
+	merged := c.accountsDelta.merge(
+		in.PlanID,
+		wire.Data.ServerKnowledge,
+		wire.Data.Accounts,
+		func(a wireAccount) string { return a.ID },
+		func(a wireAccount) bool { return a.Deleted },
+	)
+	accounts := make([]Account, 0, len(merged))
+	for _, a := range merged {
 		if a.Deleted {
 			continue
 		}
@@ -160,6 +180,9 @@ func (c *Client) ListAccounts(ctx context.Context, _ *mcp.CallToolRequest, in Li
 		}
 		accounts = append(accounts, toAccount(a))
 	}
+	// Sort by name for deterministic output; map iteration order from
+	// the cache is randomized.
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Name < accounts[j].Name })
 	return nil, ListAccountsOutput{Accounts: accounts}, nil
 }
 
@@ -233,11 +256,32 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 		rawRows = plainToTransactions(wire.Data.Transactions)
 	default:
 		path := planPath + "/transactions"
+		// Delta sync is eligible ONLY when no filters are set (no
+		// scope, no since_date, no type). If any filter is present,
+		// we do a full fetch without cache interaction because YNAB's
+		// delta semantics on filtered endpoints are under-documented.
+		canDeltaSync := in.SinceDate == "" && in.Type == ""
+		if canDeltaSync {
+			if k := c.transactionsDelta.knowledge(in.PlanID); k > 0 {
+				q.Set("last_knowledge_of_server", strconv.FormatInt(k, 10))
+			}
+		}
 		var wire wireTransactionsResponse
 		if err := c.doJSON(ctx, path, q, &wire); err != nil {
 			return nil, ListTransactionsOutput{}, sanitizedErr(err)
 		}
-		rawRows = plainToTransactions(wire.Data.Transactions)
+		if canDeltaSync {
+			merged := c.transactionsDelta.merge(
+				in.PlanID,
+				wire.Data.ServerKnowledge,
+				wire.Data.Transactions,
+				func(t wireTransaction) string { return t.ID },
+				func(t wireTransaction) bool { return t.Deleted },
+			)
+			rawRows = plainToTransactions(merged)
+		} else {
+			rawRows = plainToTransactions(wire.Data.Transactions)
+		}
 	}
 
 	sort.Slice(rawRows, func(i, j int) bool {

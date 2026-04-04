@@ -38,7 +38,8 @@ type wirePlan struct {
 
 type wireAccountsResponse struct {
 	Data struct {
-		Accounts []wireAccount `json:"accounts"`
+		Accounts        []wireAccount `json:"accounts"`
+		ServerKnowledge int64         `json:"server_knowledge"`
 	} `json:"data"`
 }
 
@@ -88,7 +89,8 @@ type wireCategory struct {
 
 type wireTransactionsResponse struct {
 	Data struct {
-		Transactions []wireTransaction `json:"transactions"`
+		Transactions    []wireTransaction `json:"transactions"`
+		ServerKnowledge int64             `json:"server_knowledge"`
 	} `json:"data"`
 }
 

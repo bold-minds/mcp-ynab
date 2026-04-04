@@ -20,7 +20,8 @@ import (
 // testClient builds a Client pointed at an httptest server. It deliberately
 // bypasses hostLockedTransport so we can exercise the rest of the client
 // against an in-process fake. The hostLockedTransport itself has dedicated
-// tests below.
+// tests below. Delta caches are intentionally nil so each test sees fresh
+// state — delta-sync integration tests use testClientWithDeltaSync below.
 func testClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -35,6 +36,17 @@ func testClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Serv
 		token:   NewToken("sk-test-TOKEN-1234567890"),
 		baseURL: srv.URL,
 	}, srv
+}
+
+// testClientWithDeltaSync is like testClient but populates the delta
+// caches so integration tests can exercise the full delta-sync code path.
+// Use this for any test that needs the cache to persist across calls.
+func testClientWithDeltaSync(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
+	t.Helper()
+	c, srv := testClient(t, handler)
+	c.accountsDelta = newDeltaCache[wireAccount]()
+	c.transactionsDelta = newDeltaCache[wireTransaction]()
+	return c, srv
 }
 
 // ---- host lock --------------------------------------------------------------
@@ -384,6 +396,125 @@ func TestLoadToken_MissingAll(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q: %q", want, msg)
 		}
+	}
+}
+
+// ---- delta sync integration -----------------------------------------------
+
+// TestDeltaSync_Accounts_FirstCallPopulatesCache verifies the two-call
+// dance: the first call issues no last_knowledge_of_server param and
+// populates the cache; the second call passes the cached knowledge and
+// receives only deltas which are merged back with the cached state.
+func TestDeltaSync_Accounts_FirstCallPopulatesCache(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	var seenKnowledge []string
+	client, _ := testClientWithDeltaSync(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		seenKnowledge = append(seenKnowledge, r.URL.Query().Get("last_knowledge_of_server"))
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			_, _ = w.Write([]byte(`{"data":{
+				"server_knowledge": 100,
+				"accounts": [
+					{"id":"a","name":"Alpha","type":"checking","on_budget":true,"closed":false,"balance":1000000,"cleared_balance":1000000,"uncleared_balance":0,"deleted":false},
+					{"id":"b","name":"Bravo","type":"savings","on_budget":true,"closed":false,"balance":2000000,"cleared_balance":2000000,"uncleared_balance":0,"deleted":false},
+					{"id":"c","name":"Charlie","type":"cash","on_budget":true,"closed":false,"balance":500000,"cleared_balance":500000,"uncleared_balance":0,"deleted":false}
+				]
+			}}`))
+		case 2:
+			_, _ = w.Write([]byte(`{"data":{
+				"server_knowledge": 200,
+				"accounts": [
+					{"id":"b","name":"Bravo","type":"savings","on_budget":true,"closed":false,"balance":2500000,"cleared_balance":2500000,"uncleared_balance":0,"deleted":false},
+					{"id":"c","name":"Charlie","type":"cash","on_budget":true,"closed":false,"balance":0,"cleared_balance":0,"uncleared_balance":0,"deleted":true},
+					{"id":"d","name":"Delta","type":"checking","on_budget":true,"closed":false,"balance":750000,"cleared_balance":750000,"uncleared_balance":0,"deleted":false}
+				]
+			}}`))
+		}
+	})
+
+	_, out1, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: "plan-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out1.Accounts) != 3 {
+		t.Errorf("first call: expected 3 accounts, got %d", len(out1.Accounts))
+	}
+
+	_, out2, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: "plan-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out2.Accounts) != 3 {
+		t.Fatalf("second call: expected 3 accounts after merge, got %d: %+v", len(out2.Accounts), out2.Accounts)
+	}
+	if len(seenKnowledge) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(seenKnowledge))
+	}
+	if seenKnowledge[0] != "" {
+		t.Errorf("first call should have no last_knowledge_of_server, got %q", seenKnowledge[0])
+	}
+	if seenKnowledge[1] != "100" {
+		t.Errorf("second call should pass last_knowledge_of_server=100, got %q", seenKnowledge[1])
+	}
+
+	seen := map[string]Account{}
+	for _, a := range out2.Accounts {
+		seen[a.Name] = a
+	}
+	if _, has := seen["Charlie"]; has {
+		t.Error("Charlie should have been removed by the delta deletion")
+	}
+	if bravo, has := seen["Bravo"]; !has {
+		t.Error("Bravo should still be present")
+	} else if bravo.Balance.Milliunits != 2500000 {
+		t.Errorf("Bravo balance should be updated to 2500000, got %d", bravo.Balance.Milliunits)
+	}
+	if _, has := seen["Delta"]; !has {
+		t.Error("Delta should have been added by the delta insertion")
+	}
+	if _, has := seen["Alpha"]; !has {
+		t.Error("Alpha should still be present from the first fetch")
+	}
+}
+
+// TestDeltaSync_Transactions_UnfilteredOnly verifies that delta sync
+// applies to unfiltered list_transactions but NOT to filtered variants.
+func TestDeltaSync_Transactions_UnfilteredOnly(t *testing.T) {
+	t.Parallel()
+	var seenQueries []string
+	client, _ := testClientWithDeltaSync(t, func(w http.ResponseWriter, r *http.Request) {
+		seenQueries = append(seenQueries, r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"server_knowledge": 500, "transactions": []}}`))
+	})
+
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{
+		PlanID: "plan-1", SinceDate: "2026-01-01",
+	})
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+
+	if len(seenQueries) != 4 {
+		t.Fatalf("expected 4 requests, got %d", len(seenQueries))
+	}
+	if seenQueries[0] != "" {
+		t.Errorf("call 1 should have no query params, got %q", seenQueries[0])
+	}
+	if !strings.Contains(seenQueries[1], "last_knowledge_of_server=500") {
+		t.Errorf("call 2 should include last_knowledge_of_server=500, got %q", seenQueries[1])
+	}
+	if strings.Contains(seenQueries[2], "last_knowledge_of_server") {
+		t.Errorf("call 3 (filtered by since_date) should NOT include last_knowledge_of_server, got %q", seenQueries[2])
+	}
+	if !strings.Contains(seenQueries[2], "since_date=2026-01-01") {
+		t.Errorf("call 3 should include since_date filter, got %q", seenQueries[2])
+	}
+	if !strings.Contains(seenQueries[3], "last_knowledge_of_server=500") {
+		t.Errorf("call 4 should resume delta sync from cached knowledge 500, got %q", seenQueries[3])
 	}
 }
 

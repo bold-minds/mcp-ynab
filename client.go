@@ -157,6 +157,20 @@ type Client struct {
 	httpClient *http.Client
 	token      Token
 	baseURL    string // overridable for tests
+
+	// Delta-sync caches for unfiltered read endpoints. nil means delta
+	// sync disabled for that endpoint — handlers that see nil fall back
+	// to full-fetch mode. Production Clients (constructed via NewClient)
+	// always populate these; the test-only testClient helper leaves them
+	// nil so each test sees fresh state.
+	//
+	// Scope is intentionally narrow per the v0.2 brief's A4 decision:
+	// only the two high-volume list endpoints. list_categories,
+	// list_plans, list_months, and get_month do NOT get delta sync in
+	// v0.2 because their responses are small and the added complexity
+	// is not justified.
+	accountsDelta     *deltaCache[wireAccount]
+	transactionsDelta *deltaCache[wireTransaction]
 }
 
 // NewClient constructs a YNAB client bound to the real YNAB API.
@@ -179,8 +193,10 @@ func NewClient(token Token) (*Client, error) {
 				return http.ErrUseLastResponse
 			},
 		},
-		token:   token,
-		baseURL: ynabBaseURL,
+		token:             token,
+		baseURL:           ynabBaseURL,
+		accountsDelta:     newDeltaCache[wireAccount](),
+		transactionsDelta: newDeltaCache[wireTransaction](),
 	}, nil
 }
 
