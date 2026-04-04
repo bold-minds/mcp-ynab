@@ -274,6 +274,11 @@ type txnFetchOpts struct {
 // semantics because the LLM-facing tool wants a small sorted slice while
 // the aggregation path wants the full unsorted set.
 //
+// YNAB supports the type filter ("uncategorized"/"unapproved") on all
+// four transaction endpoints (main, account-scoped, category-scoped,
+// payee-scoped) per the spec verified at v0.2 development time. Passing
+// txnType alongside a scope filter is a supported combination.
+//
 // Errors are returned raw; callers wrap with sanitizedErr before
 // surfacing to MCP clients.
 func (c *Client) fetchTransactions(ctx context.Context, opts txnFetchOpts) ([]Transaction, error) {

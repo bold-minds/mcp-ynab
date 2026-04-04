@@ -268,7 +268,10 @@ type Transaction struct {
 	PayeeName         string `json:"payee_name,omitempty"`
 	CategoryName      string `json:"category_name,omitempty"`
 	TransferAccountID string `json:"transfer_account_id,omitempty" jsonschema:"populated on one side of an account-transfer transaction: the account_id this transaction transfers TO. Task-shaped tools use this to avoid double-counting transfers."`
-	IsSubtransaction  bool   `json:"is_subtransaction,omitempty" jsonschema:"true when this row is a flattened split-transaction line from a category or payee filter"`
+	// IsSubtransaction has two JSON states via omitempty: true (present),
+	// or absent. Strict-typed downstream parsers should treat field
+	// absence as equivalent to false.
+	IsSubtransaction bool `json:"is_subtransaction,omitempty" jsonschema:"true when this row is a flattened split-transaction line from a category or payee filter"`
 }
 
 // MonthSummary is a lean per-month rollup used by list_months. It intentionally

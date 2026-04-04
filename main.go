@@ -12,11 +12,13 @@
 //	mcp-ynab version      — print the version and exit
 //
 // Security posture:
-//   - Read-only; no tool writes to YNAB.
+//   - Read-only by default; write tools require YNAB_ALLOW_WRITES=1.
 //   - All outbound HTTP is pinned to api.ynab.com by a custom RoundTripper.
 //   - Token is wrapped in a redacting type; all formatting paths emit
 //     [REDACTED]. It is accessible only via a package-private reveal().
-//   - A per-token rate limiter caps us at ~180 req/hr (YNAB allows 200/hr).
+//   - A per-Client rate limiter caps us at ~180 req/hr (YNAB allows
+//     200/hr). Since mcp-ynab runs one Client per process with one
+//     token, this is effectively per-token.
 //   - All error strings are sanitized to strip Bearer tokens.
 //   - Stdio-only transport; no inbound network surface.
 //

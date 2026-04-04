@@ -67,7 +67,14 @@ type CreateTransactionInput struct {
 
 type CreateTransactionOutput struct {
 	Transaction Transaction `json:"transaction"`
-	// Before is always null for create_transaction — there is no prior state.
+	// Before is always null for create_transaction — there is no prior
+	// state for a newly-created entity. It's declared as *struct{} rather
+	// than `any` or a dedicated sentinel so the field's presence in the
+	// response is unambiguous to JSON-schema-aware clients: present,
+	// null, and typed. If you're wondering why this isn't just omitted:
+	// the skill's audit log writer reads it explicitly to confirm it's
+	// handling a create vs an update, and absence would be indistinguishable
+	// from "before snapshot failed to fetch".
 	Before *struct{} `json:"before"`
 	// After is the account balance snapshot after the transaction posted.
 	// May be nil if the post-create account fetch failed (the transaction
@@ -611,13 +618,21 @@ func buildTransactionSnapshotAfter(after wireTransaction, in UpdateTransactionIn
 // buildUpdateTransactionElicitMessage renders a human-readable confirmation
 // message describing what's about to change, for display by the MCP client
 // during elicitation.
+//
+// Note on the name/ID asymmetry: the "before" values come from YNAB and
+// carry human-readable names (CategoryName, PayeeName). The "after" values
+// come from the LLM and are raw UUIDs because the update_transaction
+// tool takes IDs, not names. Rendering the new value as "Groceries →
+// a1b2c3..." would look misleading, so we label it explicitly as
+// "(new id=...)" to set the user's expectation that they are verifying
+// an ID change, not a name change. Review finding M2.
 func buildUpdateTransactionElicitMessage(before wireTransaction, in UpdateTransactionInput) string {
 	var changes []string
 	if in.CategoryID != nil {
-		changes = append(changes, fmt.Sprintf("category: %s → %s", deref(before.CategoryName), *in.CategoryID))
+		changes = append(changes, fmt.Sprintf("category: %s → (new id=%s)", deref(before.CategoryName), *in.CategoryID))
 	}
 	if in.PayeeID != nil {
-		changes = append(changes, fmt.Sprintf("payee_id: %s → %s", deref(before.PayeeID), *in.PayeeID))
+		changes = append(changes, fmt.Sprintf("payee: %s → (new id=%s)", deref(before.PayeeName), *in.PayeeID))
 	}
 	if in.PayeeName != nil {
 		changes = append(changes, fmt.Sprintf("payee_name: %q → %q", deref(before.PayeeName), *in.PayeeName))

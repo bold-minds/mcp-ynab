@@ -110,10 +110,13 @@ func checkAmountBound(amount, override int64) error {
 //  1. Build a minimal ElicitParams with a human-readable message summarizing
 //     the pending write and a single-field boolean schema.
 //  2. Call req.Session.Elicit(...).
-//  3. If elicit returns an error, the client does not support elicitation.
-//     In that case we log to stderr and return nil — the env-var gate is
-//     the whole defense for clients that cannot prompt the user. This is
-//     the graceful-degradation path the brief specifies.
+//  3. If elicit returns an error:
+//     - context.Canceled or context.DeadlineExceeded: the CALLER's context
+//       was cancelled; abort the write (the user hung up or we timed out).
+//     - any other error: treat as "client does not support elicitation",
+//       log to stderr, and return nil. The env-var gate is the whole
+//       defense for clients that cannot prompt the user. This is the
+//       graceful-degradation path the brief specifies.
 //  4. If elicit returns action="accept", proceed.
 //  5. If elicit returns action="decline" or "cancel", return an error so
 //     the handler aborts the write.
@@ -152,10 +155,18 @@ func elicitConfirmation(ctx context.Context, session *mcp.ServerSession, message
 		RequestedSchema: schema,
 	})
 	if err != nil {
-		// Client does not support elicitation. Log to stderr and proceed
-		// — the env-var gate is the whole defense in this mode. Do not
-		// propagate the error upward as a write failure; the brief
-		// explicitly specifies graceful degradation.
+		// Context cancellation or deadline means the caller genuinely
+		// wants us to stop — either the user hung up the MCP call or
+		// the per-request timeout fired. Abort the write in that case
+		// rather than proceeding through the graceful-degradation path
+		// (the env-var gate's defense, not elicitation's).
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("write cancelled before confirmation: %w", err)
+		}
+		// Any other error: treat as "client does not support
+		// elicitation". Log to stderr and proceed — the env-var gate is
+		// the whole defense in that mode. The brief explicitly specifies
+		// graceful degradation.
 		logElicitationUnsupported(err)
 		return nil
 	}

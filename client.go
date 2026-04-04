@@ -46,6 +46,10 @@ const (
 //	Over an hour (starting with a full bucket): 10 + (3600/20) = 190 calls
 //
 // well under the 200/hr ceiling.
+//
+// The limiter is per-Client, which in this binary is per-process since
+// main constructs exactly one Client. With one YNAB token per process,
+// this is effectively per-token (the behavior the YNAB docs describe).
 var (
 	defaultRate  = rate.Every(20 * time.Second)
 	defaultBurst = 10
@@ -62,6 +66,13 @@ const (
 	maxResponseBytes = 8 * 1024 * 1024
 )
 
+// maxTokenFileBytes caps how much of YNAB_API_TOKEN_FILE we read. YNAB
+// PATs are ~64 bytes; 4 KB is absurdly generous and protects against
+// pathological misconfiguration (e.g. YNAB_API_TOKEN_FILE pointed at
+// /dev/urandom or a multi-gigabyte log file) without affecting any
+// realistic use case. Matches the cap on storeTokenFromStdin.
+const maxTokenFileBytes = 4096
+
 // loadToken resolves the YNAB personal access token from, in order:
 //
 //  1. YNAB_API_TOKEN environment variable (raw value)
@@ -75,7 +86,13 @@ func loadToken() (Token, error) {
 		return NewToken(raw), nil
 	}
 	if path := os.Getenv("YNAB_API_TOKEN_FILE"); path != "" {
-		b, err := os.ReadFile(path)
+		// Bounded read — see maxTokenFileBytes doc. Review finding M5.
+		f, err := os.Open(path)
+		if err != nil {
+			return Token{}, fmt.Errorf("read YNAB_API_TOKEN_FILE: %w", err)
+		}
+		defer f.Close()
+		b, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes))
 		if err != nil {
 			return Token{}, fmt.Errorf("read YNAB_API_TOKEN_FILE: %w", err)
 		}

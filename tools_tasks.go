@@ -118,6 +118,18 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 	if in.ExtraPerMonthMilliunits < 0 {
 		return nil, YnabDebtSnapshotOutput{}, errors.New("extra_per_month_milliunits must be non-negative")
 	}
+	// Sanity ceiling on extra payment: 1 billion milliunits = $1M/month
+	// USD. This is a read-only simulation with no real-world effect, but
+	// catching absurd inputs early protects the simulation loop from
+	// degenerate behavior and surfaces obvious caller typos. Review
+	// finding L9.
+	const maxExtraPerMonthMilliunits int64 = 1_000_000_000
+	if in.ExtraPerMonthMilliunits > maxExtraPerMonthMilliunits {
+		return nil, YnabDebtSnapshotOutput{}, fmt.Errorf(
+			"extra_per_month_milliunits %d exceeds sanity ceiling of %d (~$1M USD/month); this is a safeguard against caller typos, not a real limit",
+			in.ExtraPerMonthMilliunits, maxExtraPerMonthMilliunits,
+		)
+	}
 
 	// Validate APRs.
 	for _, cfg := range in.DebtAccountConfig {
@@ -404,7 +416,7 @@ func simulateAvalanche(
 		// Safety: if after this month's payments nothing changed, we
 		// have aggregate negative amortization even with extra applied.
 		// Break out with an error.
-		if month > 0 && !progressedThisMonth(balances, initialBalances) && extraPerMonth == 0 {
+		if month > 0 && !anyProgressFromInitial(balances, initialBalances) && extraPerMonth == 0 {
 			// This should have been caught by the entry-point check, but
 			// defensive.
 			break
@@ -447,10 +459,12 @@ func simulateAvalanche(
 	}, nil
 }
 
-// progressedThisMonth reports whether at least one account has a lower
-// balance this month than it started with. Used as a last-ditch infinite
-// loop guard.
-func progressedThisMonth(current, initial []int64) bool {
+// anyProgressFromInitial reports whether at least one account has a
+// lower balance now than at the simulation start (NOT since last
+// iteration). Used as a last-ditch infinite loop guard — if the
+// avalanche simulation has not reduced any balance below its starting
+// value, we are in aggregate negative amortization and must stop.
+func anyProgressFromInitial(current, initial []int64) bool {
 	for i := range current {
 		if current[i] < initial[i] {
 			return true
@@ -1088,8 +1102,14 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 	// Collect transactions across all requested categories via the
 	// aggregation helper (NOT the user-facing ListTransactions, which
 	// truncates at 500 rows for LLM-context reasons). De-dupe by
-	// transaction id — a split transaction may contribute rows under
-	// multiple requested categories but each hybrid row has a unique id.
+	// transaction id: a split transaction might have one subtransaction
+	// under "Groceries" and another under "Restaurants" — both rows
+	// appear under their respective category scopes, but they have
+	// distinct wire IDs (the hybrid endpoint surfaces each
+	// subtransaction with its own unique id, not the parent's), so
+	// natural de-dup by Transaction.ID is correct. A single parent
+	// transaction entirely within one category contributes exactly one
+	// row. Review finding M6.
 	seen := make(map[string]Transaction)
 	var anyTruncated bool
 	for _, catID := range in.CategoryIDs {
