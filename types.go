@@ -96,20 +96,21 @@ type wireTransactionsResponse struct {
 }
 
 type wireTransaction struct {
-	ID           string  `json:"id"`
-	Date         string  `json:"date"`
-	Amount       int64   `json:"amount"`
-	Memo         *string `json:"memo"`
-	Cleared      string  `json:"cleared"`
-	Approved     bool    `json:"approved"`
-	FlagColor    *string `json:"flag_color"`
-	AccountID    string  `json:"account_id"`
-	AccountName  string  `json:"account_name"`
-	PayeeID      *string `json:"payee_id"`
-	PayeeName    *string `json:"payee_name"`
-	CategoryID   *string `json:"category_id"`
-	CategoryName *string `json:"category_name"`
-	Deleted      bool    `json:"deleted"`
+	ID                string  `json:"id"`
+	Date              string  `json:"date"`
+	Amount            int64   `json:"amount"`
+	Memo              *string `json:"memo"`
+	Cleared           string  `json:"cleared"`
+	Approved          bool    `json:"approved"`
+	FlagColor         *string `json:"flag_color"`
+	AccountID         string  `json:"account_id"`
+	AccountName       string  `json:"account_name"`
+	PayeeID           *string `json:"payee_id"`
+	PayeeName         *string `json:"payee_name"`
+	CategoryID        *string `json:"category_id"`
+	CategoryName      *string `json:"category_name"`
+	TransferAccountID *string `json:"transfer_account_id"`
+	Deleted           bool    `json:"deleted"`
 }
 
 type wireMonthDetailResponse struct {
@@ -254,19 +255,20 @@ type Category struct {
 // filter, split transactions appear as a single Transaction with
 // IsSubtransaction=false.
 type Transaction struct {
-	ID               string `json:"id"`
-	Date             string `json:"date" jsonschema:"ISO date (YYYY-MM-DD)"`
-	Amount           Money  `json:"amount" jsonschema:"signed amount; negative for outflows"`
-	Memo             string `json:"memo,omitempty"`
-	Cleared          string `json:"cleared" jsonschema:"cleared|uncleared|reconciled"`
-	Approved         bool   `json:"approved"`
-	FlagColor        string `json:"flag_color,omitempty"`
-	AccountID        string `json:"account_id"`
-	AccountName      string `json:"account_name"`
-	PayeeID          string `json:"payee_id,omitempty"`
-	PayeeName        string `json:"payee_name,omitempty"`
-	CategoryName     string `json:"category_name,omitempty"`
-	IsSubtransaction bool   `json:"is_subtransaction,omitempty" jsonschema:"true when this row is a flattened split-transaction line from a category or payee filter"`
+	ID                string `json:"id"`
+	Date              string `json:"date" jsonschema:"ISO date (YYYY-MM-DD)"`
+	Amount            Money  `json:"amount" jsonschema:"signed amount; negative for outflows"`
+	Memo              string `json:"memo,omitempty"`
+	Cleared           string `json:"cleared" jsonschema:"cleared|uncleared|reconciled"`
+	Approved          bool   `json:"approved"`
+	FlagColor         string `json:"flag_color,omitempty"`
+	AccountID         string `json:"account_id"`
+	AccountName       string `json:"account_name"`
+	PayeeID           string `json:"payee_id,omitempty"`
+	PayeeName         string `json:"payee_name,omitempty"`
+	CategoryName      string `json:"category_name,omitempty"`
+	TransferAccountID string `json:"transfer_account_id,omitempty" jsonschema:"populated on one side of an account-transfer transaction: the account_id this transaction transfers TO. Task-shaped tools use this to avoid double-counting transfers."`
+	IsSubtransaction  bool   `json:"is_subtransaction,omitempty" jsonschema:"true when this row is a flattened split-transaction line from a category or payee filter"`
 }
 
 // MonthSummary is a lean per-month rollup used by list_months. It intentionally
@@ -379,18 +381,19 @@ func toCategory(w wireCategory) Category {
 
 func toTransaction(w wireTransaction) Transaction {
 	return Transaction{
-		ID:           w.ID,
-		Date:         w.Date,
-		Amount:       NewMoney(w.Amount),
-		Memo:         deref(w.Memo),
-		Cleared:      w.Cleared,
-		Approved:     w.Approved,
-		FlagColor:    deref(w.FlagColor),
-		AccountID:    w.AccountID,
-		AccountName:  w.AccountName,
-		PayeeID:      deref(w.PayeeID),
-		PayeeName:    deref(w.PayeeName),
-		CategoryName: deref(w.CategoryName),
+		ID:                w.ID,
+		Date:              w.Date,
+		Amount:            NewMoney(w.Amount),
+		Memo:              deref(w.Memo),
+		Cleared:           w.Cleared,
+		Approved:          w.Approved,
+		FlagColor:         deref(w.FlagColor),
+		AccountID:         w.AccountID,
+		AccountName:       w.AccountName,
+		PayeeID:           deref(w.PayeeID),
+		PayeeName:         deref(w.PayeeName),
+		CategoryName:      deref(w.CategoryName),
+		TransferAccountID: deref(w.TransferAccountID),
 	}
 }
 

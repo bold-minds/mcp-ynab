@@ -1093,6 +1093,110 @@ func TestWeeklyCheckin_PeriodBoundariesAndDeltas(t *testing.T) {
 	}
 }
 
+// TestWeeklyCheckin_ExcludesTransfers is the H2 regression. A transfer
+// between two on-budget accounts creates two mirrored rows (one negative,
+// one positive). Both must be filtered out of income and outflow totals,
+// otherwise the user who moved $5K from checking to savings sees their
+// "income" jump by $5K.
+func TestWeeklyCheckin_ExcludesTransfers(t *testing.T) {
+	t.Parallel()
+	// asOf fixed at 2026-04-14. Period: 2026-04-08..14 (this), 2026-04-01..07 (prior).
+	// Response: one real $100 outflow (t-real) in the current period, plus a
+	// $5K transfer (two mirrored rows: t-out and t-in) also in the current period.
+	// Expected: this-period outflow = 100000 (not 5_100_000), inflow = 0
+	// (not 5_000_000). Transfer rows are silently dropped.
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/months/"):
+			// Simple month stub so the month-delta path doesn't error.
+			month := "2026-04-01"
+			if strings.Contains(r.URL.Path, "2026-03") {
+				month = "2026-03-01"
+			}
+			_, _ = w.Write([]byte(`{"data":{"month":{
+				"month":"` + month + `","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,"categories":[]
+			}}}`))
+		case r.URL.Query().Get("type") == "unapproved":
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/transactions"):
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[
+				{"id":"t-real","date":"2026-04-10","amount":-100000,"cleared":"cleared","approved":true,"account_id":"acct-check","account_name":"Checking","payee_name":"Target","category_name":"Shopping","deleted":false},
+				{"id":"t-out","date":"2026-04-11","amount":-5000000,"cleared":"cleared","approved":true,"account_id":"acct-check","account_name":"Checking","payee_name":"Transfer : Savings","transfer_account_id":"acct-savings","deleted":false},
+				{"id":"t-in","date":"2026-04-11","amount":5000000,"cleared":"cleared","approved":true,"account_id":"acct-savings","account_name":"Savings","payee_name":"Transfer : Checking","transfer_account_id":"acct-check","deleted":false}
+			]}}`))
+		default:
+			http.Error(w, "unexpected URL: "+r.URL.Path, http.StatusNotFound)
+		}
+	})
+	_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
+		PlanID: "p", AsOfDate: "2026-04-14",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.IncomeReceived.ThisPeriod.Milliunits != 0 {
+		t.Errorf("transfer inflow leaked into income_received: %d (should be 0)", out.IncomeReceived.ThisPeriod.Milliunits)
+	}
+	if out.TotalOutflows.ThisPeriod.Milliunits != 100000 {
+		t.Errorf("transfer outflow leaked into total_outflows: %d (should be 100000)", out.TotalOutflows.ThisPeriod.Milliunits)
+	}
+}
+
+// TestStatus_UnapprovedCountDeduplicatesTransfers is the H3 regression.
+// An unapproved transfer appears as two rows; it should count as 1
+// pending cleanup item, not 2.
+func TestStatus_UnapprovedCountDeduplicatesTransfers(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/months/current"):
+			_, _ = w.Write([]byte(`{"data":{"month":{"month":"2026-04-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,"categories":[]}}}`))
+		case strings.HasSuffix(r.URL.Path, "/accounts"):
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"accounts":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/categories"):
+			_, _ = w.Write([]byte(`{"data":{"category_groups":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/scheduled_transactions"):
+			_, _ = w.Write([]byte(`{"data":{"scheduled_transactions":[]}}`))
+		case r.URL.Query().Get("type") == "unapproved":
+			// Three unapproved items:
+			//  - one real transaction (count 1)
+			//  - one transfer (two mirrored rows, should count 1)
+			// Expected total: 2
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[
+				{"id":"u1","date":"2026-04-05","amount":-2500,"cleared":"uncleared","approved":false,"account_id":"a","account_name":"Checking","deleted":false},
+				{"id":"u2-out","date":"2026-04-06","amount":-10000,"cleared":"uncleared","approved":false,"account_id":"a","account_name":"Checking","transfer_account_id":"b","deleted":false},
+				{"id":"u2-in","date":"2026-04-06","amount":10000,"cleared":"uncleared","approved":false,"account_id":"b","account_name":"Savings","transfer_account_id":"a","deleted":false}
+			]}}`))
+		default:
+			http.Error(w, "unexpected URL: "+r.URL.Path, http.StatusNotFound)
+		}
+	})
+	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{PlanID: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.UnapprovedTransactionCount != 2 {
+		t.Errorf("expected unapproved count of 2 (1 real + 1 deduped transfer), got %d", out.UnapprovedTransactionCount)
+	}
+}
+
+func TestCountUnapprovedExcludingTransferMirrors(t *testing.T) {
+	t.Parallel()
+	in := []Transaction{
+		{ID: "a"},                                               // real +1
+		{ID: "b"},                                               // real +1
+		{ID: "c-out", Amount: NewMoney(-5000), TransferAccountID: "x"}, // transfer out +1 (counted)
+		{ID: "c-in", Amount: NewMoney(5000), TransferAccountID: "y"},  // transfer in +0 (not counted)
+		{ID: "d-in", Amount: NewMoney(3000), TransferAccountID: "z"},  // transfer in alone +0
+		{ID: "e-out", Amount: NewMoney(-2000), TransferAccountID: "w"}, // transfer out alone +1
+	}
+	if got := countUnapprovedExcludingTransferMirrors(in); got != 4 {
+		t.Errorf("expected 4 (2 real + 2 transfer outflows), got %d", got)
+	}
+}
+
 func TestWeeklyCheckin_CategoryResolvedFromOverspent(t *testing.T) {
 	t.Parallel()
 	// Prior month: Groceries was overspent. Current month: still -30000

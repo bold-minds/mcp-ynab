@@ -445,6 +445,31 @@ func progressedThisMonth(current, initial []int64) bool {
 	return false
 }
 
+// countUnapprovedExcludingTransferMirrors counts pending-cleanup items
+// without double-counting a transfer between on-budget accounts. YNAB
+// represents an on-budget-to-on-budget transfer as two mirrored
+// transactions (one positive, one negative), each with transfer_account_id
+// set. Each unapproved transfer should show up as ONE pending item in the
+// user's "approve these" queue, not two.
+//
+// Implementation: for non-transfer rows, count them all. For transfer
+// rows, count only the outflow side (Amount < 0). This is stable
+// regardless of which side the user encounters first in the UI.
+func countUnapprovedExcludingTransferMirrors(txns []Transaction) int {
+	n := 0
+	for _, t := range txns {
+		if t.TransferAccountID == "" {
+			n++
+			continue
+		}
+		// Transfer row: count the outflow side only.
+		if t.Amount.Milliunits < 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // ============================================================================
 // ynab_status — one-call dashboard snapshot for the Sunday ritual
 // ============================================================================
@@ -568,6 +593,9 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 
 	// 4. Unapproved transaction count — aggregation path so we get the
 	// FULL count, not a 500-row trim. truncated is surfaced in the output.
+	// Transfers between on-budget accounts appear as two unapproved rows;
+	// count one side only (the outflow) so a single unapproved transfer
+	// counts as 1 pending item, not 2.
 	unapprovedRows, unapprovedTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
 		planID:  in.PlanID,
 		txnType: "unapproved",
@@ -575,6 +603,7 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	if err != nil {
 		return nil, YnabStatusOutput{}, sanitizedErr(err)
 	}
+	unapprovedCount := countUnapprovedExcludingTransferMirrors(unapprovedRows)
 
 	// 5. Scheduled transactions for next 7 days window.
 	_, schedOut, err := c.ListScheduledTransactions(ctx, nil, ListScheduledTransactionsInput{
@@ -587,7 +616,7 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// Compose the output from the fetched data.
 	out := YnabStatusOutput{
 		ReadyToAssign:              monthOut.ToBeBudgeted,
-		UnapprovedTransactionCount: len(unapprovedRows),
+		UnapprovedTransactionCount: unapprovedCount,
 		Truncated:                  unapprovedTruncated,
 	}
 
@@ -830,11 +859,20 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 		out.Truncated = true
 	}
 
+	// Transfers between on-budget accounts appear as two mirrored rows
+	// (one positive, one negative) and would double-inflate both the
+	// inflow and outflow totals if we summed them naively. YNAB marks
+	// both sides with transfer_account_id != nil (the account_id the
+	// transfer moves TO); filter these rows out so weekly income/outflow
+	// reflect real money in/out of the budget.
 	var thisInflow, priorInflow int64
 	var thisOutflow, priorOutflow int64
 	for _, t := range txns {
 		if t.Date < priorStartStr || t.Date > thisEndStr {
 			continue
+		}
+		if t.TransferAccountID != "" {
+			continue // see transfer-exclusion comment above
 		}
 		inThis := t.Date >= thisStartStr && t.Date <= thisEndStr
 		inPrior := t.Date >= priorStartStr && t.Date <= priorEndStr
@@ -866,7 +904,9 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 	}
 
 	// Unapproved count across the plan (not period-scoped). Aggregation
-	// path so we count the full set, not a 500-row trim.
+	// path so we count the full set, not a 500-row trim. Transfers between
+	// on-budget accounts appear as two unapproved rows; count one side
+	// only (the outflow) to avoid double-counting.
 	unapprovedRows, unapprovedTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
 		planID:  in.PlanID,
 		txnType: "unapproved",
@@ -877,7 +917,7 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 	if unapprovedTruncated {
 		out.Truncated = true
 	}
-	out.UnapprovedCount = len(unapprovedRows)
+	out.UnapprovedCount = countUnapprovedExcludingTransferMirrors(unapprovedRows)
 
 	// Month-over-month newly-overspent comparison. Fetch current and
 	// prior month, compare category balance signs.
