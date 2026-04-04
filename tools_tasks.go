@@ -519,18 +519,22 @@ type ScheduledNext7Days struct {
 
 // YnabStatusOutput is the dashboard response.
 type YnabStatusOutput struct {
-	ReadyToAssign Money                          `json:"ready_to_assign" jsonschema:"current plan's to_be_budgeted amount"`
+	ReadyToAssign       Money                    `json:"ready_to_assign" jsonschema:"current plan's to_be_budgeted amount"`
 	OverspentCategories []OverspentCategoryEntry `json:"overspent_categories"`
 	// CreditCardPaymentCategoriesExcludedCount tells the LLM whether any
 	// categories were filtered out of overspent_categories because they
 	// are auto-managed credit card payment categories. Allows honest
 	// reporting per the Q3 decision in the v0.2 brief.
-	CreditCardPaymentCategoriesExcludedCount int `json:"credit_card_payment_categories_excluded_count"`
-	DebtAccounts              []DebtStatusEntry             `json:"debt_accounts"`
-	SavingsAccounts           []Account                     `json:"savings_accounts"`
-	DaysSinceLastReconciled   []DaysSinceLastReconciledEntry `json:"days_since_last_reconciled"`
-	UnapprovedTransactionCount int                          `json:"unapproved_transaction_count"`
-	ScheduledNext7Days        ScheduledNext7Days             `json:"scheduled_next_7_days"`
+	CreditCardPaymentCategoriesExcludedCount int                            `json:"credit_card_payment_categories_excluded_count"`
+	DebtAccounts                             []DebtStatusEntry              `json:"debt_accounts"`
+	SavingsAccounts                          []Account                      `json:"savings_accounts"`
+	DaysSinceLastReconciled                  []DaysSinceLastReconciledEntry `json:"days_since_last_reconciled"`
+	UnapprovedTransactionCount               int                            `json:"unapproved_transaction_count"`
+	ScheduledNext7Days                       ScheduledNext7Days             `json:"scheduled_next_7_days"`
+	// Truncated is true when the unapproved-transaction count exceeded
+	// the internal aggregation safety ceiling. The count in that case is
+	// a lower bound.
+	Truncated bool `json:"truncated,omitempty" jsonschema:"true when unapproved_transaction_count hit the internal 50000-row safety ceiling; the count is a lower bound in that case"`
 }
 
 // YnabStatus returns a Sunday-ritual dashboard in one call, composing
@@ -562,11 +566,11 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 		return nil, YnabStatusOutput{}, sanitizedErr(err)
 	}
 
-	// 4. Unapproved transaction count.
-	_, unapprovedOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
-		PlanID: in.PlanID,
-		Type:   "unapproved",
-		Limit:  500,
+	// 4. Unapproved transaction count — aggregation path so we get the
+	// FULL count, not a 500-row trim. truncated is surfaced in the output.
+	unapprovedRows, unapprovedTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
+		planID:  in.PlanID,
+		txnType: "unapproved",
 	})
 	if err != nil {
 		return nil, YnabStatusOutput{}, sanitizedErr(err)
@@ -583,7 +587,8 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// Compose the output from the fetched data.
 	out := YnabStatusOutput{
 		ReadyToAssign:              monthOut.ToBeBudgeted,
-		UnapprovedTransactionCount: len(unapprovedOut.Transactions),
+		UnapprovedTransactionCount: len(unapprovedRows),
+		Truncated:                  unapprovedTruncated,
 	}
 
 	// Overspent categories: balance < 0 AND not in the Credit Card
@@ -766,6 +771,11 @@ type YnabWeeklyCheckinOutput struct {
 	// PeriodGroupingNote is a redundant explanation so the LLM cannot
 	// miss the month/week scope mismatch when rendering a summary.
 	PeriodGroupingNote string `json:"period_grouping_note"`
+
+	// Truncated is true when the period-scope transaction fetch or the
+	// unapproved count fetch hit the internal 50K safety ceiling. The
+	// numeric fields are lower bounds in that case.
+	Truncated bool `json:"truncated,omitempty" jsonschema:"true when at least one underlying transaction fetch exceeded the 50000-row safety ceiling; weekly deltas and unapproved_count are lower bounds when true"`
 }
 
 // YnabWeeklyCheckin composes multiple reads to build a week-over-week
@@ -803,20 +813,26 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 			"(YNAB's API does not expose category balances at day granularity); all other fields are week-granular.",
 	}
 
-	// Fetch transactions from priorStart onward in a single call, then
-	// filter client-side into the two windows.
-	_, txnsOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
-		PlanID:    in.PlanID,
-		SinceDate: priorStartStr,
-		Limit:     500,
+	// Fetch transactions from priorStart onward in a single call via the
+	// aggregation path so the 500-row LLM-context trim doesn't silently
+	// drop older transactions. This is critical: the prior week is
+	// "older" than this week, so a 500-row trim on the base list would
+	// evict the prior week first and leave every prior-period number
+	// wrong without any indication.
+	txns, periodTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
+		planID:    in.PlanID,
+		sinceDate: priorStartStr,
 	})
 	if err != nil {
 		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
 	}
+	if periodTruncated {
+		out.Truncated = true
+	}
 
 	var thisInflow, priorInflow int64
 	var thisOutflow, priorOutflow int64
-	for _, t := range txnsOut.Transactions {
+	for _, t := range txns {
 		if t.Date < priorStartStr || t.Date > thisEndStr {
 			continue
 		}
@@ -849,14 +865,19 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 		Delta:       NewMoney(thisOutflow - priorOutflow),
 	}
 
-	// Unapproved count across the plan (not period-scoped).
-	_, unapprovedOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
-		PlanID: in.PlanID, Type: "unapproved", Limit: 500,
+	// Unapproved count across the plan (not period-scoped). Aggregation
+	// path so we count the full set, not a 500-row trim.
+	unapprovedRows, unapprovedTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
+		planID:  in.PlanID,
+		txnType: "unapproved",
 	})
 	if err != nil {
 		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
 	}
-	out.UnapprovedCount = len(unapprovedOut.Transactions)
+	if unapprovedTruncated {
+		out.Truncated = true
+	}
+	out.UnapprovedCount = len(unapprovedRows)
 
 	// Month-over-month newly-overspent comparison. Fetch current and
 	// prior month, compare category balance signs.
@@ -932,13 +953,21 @@ type YnabSpendingCheckInput struct {
 }
 
 // YnabSpendingCheckOutput reports the result of the spending check.
+//
+// OnPlan is a nullable boolean: present when the tool could aggregate the
+// full matching transaction set, absent when the aggregation hit the
+// internal safety ceiling (Truncated=true). In the truncated case,
+// VerdictUnavailableReason explains why the tool refuses to give a
+// verdict on incomplete data.
 type YnabSpendingCheckOutput struct {
-	OnPlan                bool          `json:"on_plan" jsonschema:"true if actual spending is less than or equal to the budget"`
-	ActualMilliunits      int64         `json:"actual_milliunits" jsonschema:"net spending in the scope (positive = net outflow, negative = net inflow from refunds)"`
-	BudgetMilliunits      int64         `json:"budget_milliunits"`
-	DeltaMilliunits       int64         `json:"delta_milliunits" jsonschema:"actual - budget. Positive = over budget, negative = under budget."`
-	TransactionCount      int           `json:"transaction_count"`
-	OffendingTransactions []Transaction `json:"offending_transactions,omitempty" jsonschema:"populated only when actual > budget: the transactions that contributed to the overspend, sorted by amount descending (biggest contributors first)"`
+	OnPlan                   *bool         `json:"on_plan,omitempty" jsonschema:"present only when the answer is reliable: true if actual <= budget, false if actual > budget. Absent when Truncated=true."`
+	ActualMilliunits         int64         `json:"actual_milliunits" jsonschema:"net spending in the scope (positive = net outflow, negative = net inflow from refunds)"`
+	BudgetMilliunits         int64         `json:"budget_milliunits"`
+	DeltaMilliunits          int64         `json:"delta_milliunits" jsonschema:"actual - budget. Positive = over budget, negative = under budget. May be unreliable when Truncated=true."`
+	TransactionCount         int           `json:"transaction_count"`
+	OffendingTransactions    []Transaction `json:"offending_transactions,omitempty" jsonschema:"populated only when actual > budget AND not truncated: the transactions that contributed to the overspend, sorted by amount descending (biggest contributors first)"`
+	Truncated                bool          `json:"truncated,omitempty" jsonschema:"true when at least one category fetch exceeded the internal 50000-row safety ceiling. When true, OnPlan is absent and numeric fields are lower bounds."`
+	VerdictUnavailableReason string        `json:"verdict_unavailable_reason,omitempty" jsonschema:"populated only when Truncated=true; explains why on_plan cannot be given"`
 }
 
 // YnabSpendingCheck aggregates spending across one or more categories
@@ -947,10 +976,16 @@ type YnabSpendingCheckOutput struct {
 // when over budget so the LLM can narrate which transactions pushed
 // the user over.
 //
-// Implementation: calls list_transactions once per category_id with the
-// category scope filter. The SDK's hybrid endpoint flattens split
-// transactions to subtransaction rows, which gives us correct per-
-// category attribution for split transactions.
+// Implementation: calls the shared fetchTransactionsForAggregation helper
+// once per category_id with the category scope filter. The category and
+// payee scoped YNAB endpoints return HybridTransactions which flatten
+// split transactions to subtransaction rows — each row has a unique id
+// so de-duping by Transaction.ID across category scopes is correct.
+//
+// If any per-category fetch exceeds aggregationCeiling (50K rows), the
+// output sets Truncated=true, drops OnPlan entirely (the tool refuses to
+// give a verdict on incomplete data), and sets VerdictUnavailableReason
+// for the LLM to relay.
 func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, in YnabSpendingCheckInput) (*mcp.CallToolResult, YnabSpendingCheckOutput, error) {
 	if in.PlanID == "" {
 		return nil, YnabSpendingCheckOutput{}, errors.New("plan_id is required")
@@ -979,24 +1014,28 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 		excluded[id] = struct{}{}
 	}
 
-	// Collect transactions across all requested categories. De-dupe by
-	// transaction id because a split transaction might contribute lines
-	// to multiple of the requested categories, but each line has a unique
-	// id so natural de-dup works.
+	// Collect transactions across all requested categories via the
+	// aggregation helper (NOT the user-facing ListTransactions, which
+	// truncates at 500 rows for LLM-context reasons). De-dupe by
+	// transaction id — a split transaction may contribute rows under
+	// multiple requested categories but each hybrid row has a unique id.
 	seen := make(map[string]Transaction)
+	var anyTruncated bool
 	for _, catID := range in.CategoryIDs {
-		_, txnsOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
-			PlanID:     in.PlanID,
-			CategoryID: catID,
-			SinceDate:  in.StartDate,
-			Limit:      500, // YNAB scope endpoint returns in chronological order; take the max
+		rows, truncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
+			planID:     in.PlanID,
+			sinceDate:  in.StartDate,
+			categoryID: catID,
 		})
 		if err != nil {
 			return nil, YnabSpendingCheckOutput{}, sanitizedErr(err)
 		}
-		for _, t := range txnsOut.Transactions {
-			// Date range filter: list_transactions applies since_date but
-			// not end_date, so we filter end_date here.
+		if truncated {
+			anyTruncated = true
+		}
+		for _, t := range rows {
+			// Date range filter: fetchTransactions applies since_date
+			// but not end_date, so we filter end_date here.
 			if t.Date > in.EndDate {
 				continue
 			}
@@ -1022,32 +1061,42 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 	}
 
 	delta := netOutflowMu - in.BudgetMilliunits
-	onPlan := delta <= 0
-
 	out := YnabSpendingCheckOutput{
-		OnPlan:           onPlan,
 		ActualMilliunits: netOutflowMu,
 		BudgetMilliunits: in.BudgetMilliunits,
 		DeltaMilliunits:  delta,
 		TransactionCount: len(txns),
 	}
 
-	// Only surface offending transactions when over budget. Sort biggest
-	// absolute amount first so the LLM can narrate "the Whole Foods
-	// $145 trip and the Costco $200 trip put you over".
-	if !onPlan {
-		sort.Slice(txns, func(i, j int) bool {
-			ai := txns[i].Amount.Milliunits
-			if ai < 0 {
-				ai = -ai
-			}
-			aj := txns[j].Amount.Milliunits
-			if aj < 0 {
-				aj = -aj
-			}
-			return ai > aj
-		})
-		out.OffendingTransactions = txns
+	if anyTruncated {
+		out.Truncated = true
+		out.VerdictUnavailableReason = fmt.Sprintf(
+			"at least one category fetch exceeded the internal safety ceiling of %d transactions; "+
+				"refusing to give an on_plan verdict on incomplete data. Narrow the date range with start_date "+
+				"or query fewer categories at a time.",
+			aggregationCeiling,
+		)
+	} else {
+		onPlan := delta <= 0
+		out.OnPlan = &onPlan
+		// Only surface offending transactions when over budget and we
+		// have the complete set. Sort biggest absolute amount first so
+		// the LLM can narrate "the Whole Foods $145 and Costco $200
+		// trips put you over".
+		if !onPlan {
+			sort.Slice(txns, func(i, j int) bool {
+				ai := txns[i].Amount.Milliunits
+				if ai < 0 {
+					ai = -ai
+				}
+				aj := txns[j].Amount.Milliunits
+				if aj < 0 {
+					aj = -aj
+				}
+				return ai > aj
+			})
+			out.OffendingTransactions = txns
+		}
 	}
 	return nil, out, nil
 }

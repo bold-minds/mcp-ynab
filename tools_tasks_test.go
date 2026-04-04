@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -399,8 +400,11 @@ func TestSpendingCheck_UnderBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !out.OnPlan {
-		t.Errorf("expected on_plan=true, got delta=%d", out.DeltaMilliunits)
+	if out.OnPlan == nil || !*out.OnPlan {
+		t.Errorf("expected on_plan=true, got %v delta=%d", out.OnPlan, out.DeltaMilliunits)
+	}
+	if out.Truncated {
+		t.Errorf("did not expect truncation")
 	}
 	if out.ActualMilliunits != 200_000 {
 		t.Errorf("expected actual=200_000 ($200), got %d", out.ActualMilliunits)
@@ -433,8 +437,8 @@ func TestSpendingCheck_OverBudgetIncludesOffendingSortedBySize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.OnPlan {
-		t.Errorf("expected on_plan=false")
+	if out.OnPlan == nil || *out.OnPlan {
+		t.Errorf("expected on_plan=false, got %v", out.OnPlan)
 	}
 	if out.ActualMilliunits != 360_000 {
 		t.Errorf("expected 360_000 actual, got %d", out.ActualMilliunits)
@@ -549,6 +553,53 @@ func TestSpendingCheck_InputValidation(t *testing.T) {
 				t.Errorf("expected error containing %q, got %v", c.want, err)
 			}
 		})
+	}
+}
+
+// TestSpendingCheck_AggregationExceeds500RowLimit is the H1 regression test.
+// The public ListTransactions trims to 500 rows for LLM-context reasons.
+// YnabSpendingCheck MUST NOT silently inherit that trim or it would report
+// wrong totals on categories with >500 matching transactions. This test
+// returns 600 matching rows and verifies the spending check sees all 600.
+func TestSpendingCheck_AggregationExceeds500RowLimit(t *testing.T) {
+	t.Parallel()
+	// Build a response with 600 transactions each for -$1 (1000 milliunits
+	// outflow). Total should be $600 — a plain 500-trim would report $500.
+	var buf strings.Builder
+	buf.WriteString(`{"data":{"server_knowledge":1,"transactions":[`)
+	for i := 0; i < 600; i++ {
+		if i > 0 {
+			buf.WriteString(",")
+		}
+		// Dates all within [2026-04-01, 2026-04-07]
+		day := 1 + (i % 7)
+		fmt.Fprintf(&buf, `{"id":"t%d","type":"transaction","date":"2026-04-%02d","amount":-1000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"C","category_name":"Groceries","deleted":false}`, i, day)
+	}
+	buf.WriteString(`]}}`)
+	body := buf.String()
+
+	client, _ := testClient(t, categoryTxnHandler(body))
+	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
+		PlanID:           "p",
+		CategoryIDs:      []string{"cat"},
+		StartDate:        "2026-04-01",
+		EndDate:          "2026-04-30",
+		BudgetMilliunits: 10_000_000, // $10K budget, way under the $600 total
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.TransactionCount != 600 {
+		t.Errorf("expected 600 transactions in the aggregation, got %d (the 500-trim bug would show 500)", out.TransactionCount)
+	}
+	if out.ActualMilliunits != 600_000 {
+		t.Errorf("expected 600_000 milliunits actual, got %d", out.ActualMilliunits)
+	}
+	if out.Truncated {
+		t.Errorf("600 rows should not trigger the 50K ceiling")
+	}
+	if out.OnPlan == nil || !*out.OnPlan {
+		t.Errorf("should be on plan with $10K budget vs $600 spent, got %v", out.OnPlan)
 	}
 }
 

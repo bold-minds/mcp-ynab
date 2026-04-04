@@ -214,74 +214,25 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 	case limit > 500:
 		limit = 500
 	}
-	q := url.Values{}
-	if in.SinceDate != "" {
-		q.Set("since_date", in.SinceDate)
-	}
-	if in.Type != "" {
-		if in.Type != "uncategorized" && in.Type != "unapproved" {
-			return nil, ListTransactionsOutput{}, errors.New("type must be 'uncategorized' or 'unapproved'")
-		}
-		q.Set("type", in.Type)
+	if in.Type != "" && in.Type != "uncategorized" && in.Type != "unapproved" {
+		return nil, ListTransactionsOutput{}, errors.New("type must be 'uncategorized' or 'unapproved'")
 	}
 
-	planPath := "/plans/" + url.PathEscape(in.PlanID)
-
-	// The account endpoint returns TransactionsResponse (same shape as the
-	// main endpoint). The category and payee endpoints return
-	// HybridTransactionsResponse, where split transactions are flattened
-	// to subtransaction rows so the scope filter works correctly.
-	var rawRows []Transaction
-	switch {
-	case in.CategoryID != "":
-		path := planPath + "/categories/" + url.PathEscape(in.CategoryID) + "/transactions"
-		var wire wireHybridTransactionsResponse
-		if err := c.doJSON(ctx, path, q, &wire); err != nil {
-			return nil, ListTransactionsOutput{}, sanitizedErr(err)
-		}
-		rawRows = hybridToTransactions(wire.Data.Transactions)
-	case in.PayeeID != "":
-		path := planPath + "/payees/" + url.PathEscape(in.PayeeID) + "/transactions"
-		var wire wireHybridTransactionsResponse
-		if err := c.doJSON(ctx, path, q, &wire); err != nil {
-			return nil, ListTransactionsOutput{}, sanitizedErr(err)
-		}
-		rawRows = hybridToTransactions(wire.Data.Transactions)
-	case in.AccountID != "":
-		path := planPath + "/accounts/" + url.PathEscape(in.AccountID) + "/transactions"
-		var wire wireTransactionsResponse
-		if err := c.doJSON(ctx, path, q, &wire); err != nil {
-			return nil, ListTransactionsOutput{}, sanitizedErr(err)
-		}
-		rawRows = plainToTransactions(wire.Data.Transactions)
-	default:
-		path := planPath + "/transactions"
-		// Delta sync is eligible ONLY when no filters are set (no
-		// scope, no since_date, no type). If any filter is present,
-		// we do a full fetch without cache interaction because YNAB's
-		// delta semantics on filtered endpoints are under-documented.
-		canDeltaSync := in.SinceDate == "" && in.Type == ""
-		if canDeltaSync {
-			if k := c.transactionsDelta.knowledge(in.PlanID); k > 0 {
-				q.Set("last_knowledge_of_server", strconv.FormatInt(k, 10))
-			}
-		}
-		var wire wireTransactionsResponse
-		if err := c.doJSON(ctx, path, q, &wire); err != nil {
-			return nil, ListTransactionsOutput{}, sanitizedErr(err)
-		}
-		if canDeltaSync {
-			merged := c.transactionsDelta.merge(
-				in.PlanID,
-				wire.Data.ServerKnowledge,
-				wire.Data.Transactions,
-				func(t wireTransaction) string { return t.ID },
-				func(t wireTransaction) bool { return t.Deleted },
-			)
-			rawRows = plainToTransactions(merged)
-		} else {
-			rawRows = plainToTransactions(wire.Data.Transactions)
-		}
+	// Fetch via the shared internal helper, which also services the
+	// aggregation path used by task-shaped tools. The helper applies
+	// delta sync and dispatches to the correct YNAB endpoint based on
+	// scope, but does NOT sort or truncate — that is this handler's
+	// responsibility since the LLM-facing limit is user-configurable.
+	rawRows, err := c.fetchTransactions(ctx, txnFetchOpts{
+		planID:     in.PlanID,
+		sinceDate:  in.SinceDate,
+		txnType:    in.Type,
+		accountID:  in.AccountID,
+		categoryID: in.CategoryID,
+		payeeID:    in.PayeeID,
+	})
+	if err != nil {
+		return nil, ListTransactionsOutput{}, sanitizedErr(err)
 	}
 
 	sort.Slice(rawRows, func(i, j int) bool {
@@ -295,6 +246,132 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 		Transactions: rawRows,
 		Truncated:    truncated,
 	}, nil
+}
+
+// ---- shared transaction fetch internals -----------------------------------
+
+// txnFetchOpts describes an internal transaction read. At most one scope
+// filter (accountID / categoryID / payeeID) may be non-empty; the caller
+// is responsible for enforcing that invariant. sinceDate and txnType are
+// forwarded to YNAB as query parameters when non-empty.
+type txnFetchOpts struct {
+	planID     string
+	sinceDate  string
+	txnType    string // "", "uncategorized", "unapproved"
+	accountID  string
+	categoryID string
+	payeeID    string
+}
+
+// fetchTransactions is the shared transaction-read path used by both the
+// user-facing ListTransactions handler and the internal
+// fetchTransactionsForAggregation helper used by task-shaped tools.
+//
+// It dispatches to the correct YNAB endpoint based on which scope filter
+// is set, applies delta sync for the unfiltered-plan path when eligible,
+// and returns the non-deleted transactions as []Transaction. It does NOT
+// sort and it does NOT truncate — callers decide ordering and limit
+// semantics because the LLM-facing tool wants a small sorted slice while
+// the aggregation path wants the full unsorted set.
+//
+// Errors are returned raw; callers wrap with sanitizedErr before
+// surfacing to MCP clients.
+func (c *Client) fetchTransactions(ctx context.Context, opts txnFetchOpts) ([]Transaction, error) {
+	q := url.Values{}
+	if opts.sinceDate != "" {
+		q.Set("since_date", opts.sinceDate)
+	}
+	if opts.txnType != "" {
+		q.Set("type", opts.txnType)
+	}
+	planPath := "/plans/" + url.PathEscape(opts.planID)
+
+	// The account endpoint returns TransactionsResponse (same shape as
+	// the main endpoint). The category and payee endpoints return
+	// HybridTransactionsResponse, where split transactions are flattened
+	// to subtransaction rows so the scope filter works correctly.
+	switch {
+	case opts.categoryID != "":
+		path := planPath + "/categories/" + url.PathEscape(opts.categoryID) + "/transactions"
+		var wire wireHybridTransactionsResponse
+		if err := c.doJSON(ctx, path, q, &wire); err != nil {
+			return nil, err
+		}
+		return hybridToTransactions(wire.Data.Transactions), nil
+	case opts.payeeID != "":
+		path := planPath + "/payees/" + url.PathEscape(opts.payeeID) + "/transactions"
+		var wire wireHybridTransactionsResponse
+		if err := c.doJSON(ctx, path, q, &wire); err != nil {
+			return nil, err
+		}
+		return hybridToTransactions(wire.Data.Transactions), nil
+	case opts.accountID != "":
+		path := planPath + "/accounts/" + url.PathEscape(opts.accountID) + "/transactions"
+		var wire wireTransactionsResponse
+		if err := c.doJSON(ctx, path, q, &wire); err != nil {
+			return nil, err
+		}
+		return plainToTransactions(wire.Data.Transactions), nil
+	default:
+		path := planPath + "/transactions"
+		// Delta sync is eligible ONLY when no filters are set (no
+		// scope, no since_date, no type). If any filter is present,
+		// we do a full fetch without cache interaction because YNAB's
+		// delta semantics on filtered endpoints are under-documented.
+		canDeltaSync := opts.sinceDate == "" && opts.txnType == ""
+		if canDeltaSync {
+			if k := c.transactionsDelta.knowledge(opts.planID); k > 0 {
+				q.Set("last_knowledge_of_server", strconv.FormatInt(k, 10))
+			}
+		}
+		var wire wireTransactionsResponse
+		if err := c.doJSON(ctx, path, q, &wire); err != nil {
+			return nil, err
+		}
+		if canDeltaSync {
+			merged := c.transactionsDelta.merge(
+				opts.planID,
+				wire.Data.ServerKnowledge,
+				wire.Data.Transactions,
+				func(t wireTransaction) string { return t.ID },
+				func(t wireTransaction) bool { return t.Deleted },
+			)
+			return plainToTransactions(merged), nil
+		}
+		return plainToTransactions(wire.Data.Transactions), nil
+	}
+}
+
+// aggregationCeiling is the safety cap on transactions returned from
+// fetchTransactionsForAggregation. 50,000 gives roughly 10 years of
+// daily spending headroom on a single plan; no realistic plan should
+// exceed this. When hit, the aggregation path reports truncated=true so
+// task tools can surface the condition.
+const aggregationCeiling = 50_000
+
+// fetchTransactionsForAggregation is the internal path used by
+// task-shaped tools (ynab_status, ynab_spending_check, ynab_weekly_checkin)
+// that need the full transaction set for correct sum/count/filter math.
+// Unlike the user-facing ListTransactions, it does NOT apply the 500-row
+// LLM-context trim — correctness beats response size for aggregation.
+//
+// The 50K aggregationCeiling is a last-line safety check; callers that
+// see truncated=true should either refuse to give a verdict (spending
+// check) or surface the flag alongside the numbers (dashboards).
+//
+// Returns (rows, truncated, error):
+//   - rows: non-deleted transactions matching opts, up to aggregationCeiling
+//   - truncated: true iff the ceiling was hit
+//   - error: raw; callers wrap with sanitizedErr
+func (c *Client) fetchTransactionsForAggregation(ctx context.Context, opts txnFetchOpts) ([]Transaction, bool, error) {
+	rows, err := c.fetchTransactions(ctx, opts)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) > aggregationCeiling {
+		return rows[:aggregationCeiling], true, nil
+	}
+	return rows, false, nil
 }
 
 // plainToTransactions converts a slice of wireTransaction (from the main or
