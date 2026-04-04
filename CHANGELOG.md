@@ -6,36 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ## [Unreleased]
 
-### Changed (breaking, v0.2.0-rc.2 vs v0.2.0-rc.1)
-
-- `ynab_status.savings_accounts` renamed to `ynab_status.liquid_accounts`, and the field now includes `checking` and `cash` account types alongside `savings`. The previous field only surfaced savings-type accounts, which missed users whose Ready-to-Assign cushion lives on a checking balance. Review finding L5.
-
-### Fixed (v0.2.0-rc.1 code review)
-
-High-severity (silent correctness bugs):
-- **H1**: Task tools no longer inherit `ListTransactions`'s 500-row LLM-context trim. New `fetchTransactionsForAggregation` with a 50,000-row safety ceiling is used by `ynab_spending_check`, `ynab_weekly_checkin`, and `ynab_status`. `YnabSpendingCheckOutput.OnPlan` is now `*bool` and absent when `Truncated=true`, replaced by `VerdictUnavailableReason`.
-- **H2**: `ynab_weekly_checkin` no longer double-counts transfers between on-budget accounts in its `income_received` and `total_outflows` sums. `Transaction.TransferAccountID` is now plumbed through from YNAB's wire field; transfer rows are filtered out at the aggregation boundary.
-- **H3**: `ynab_status.unapproved_transaction_count` deduplicates transfer mirror rows via `countUnapprovedExcludingTransferMirrors`. An unapproved transfer now counts as 1 pending item, not 2.
-
-Medium-severity:
-- **M1**: `elicitConfirmation` distinguishes `context.Canceled` / `context.DeadlineExceeded` (abort) from other elicit errors (graceful-degrade as unsupported-client).
-- **M2**: `update_transaction` elicitation message renders new category/payee UUIDs as `(new id=...)` instead of next to a name, making the name-vs-id asymmetry explicit.
-- **M5**: `loadToken` `YNAB_API_TOKEN_FILE` reads are bounded at 4 KB via `io.LimitReader`.
-
-Low-severity:
-- **B2**: `simulateAvalanche` payoff-order tiebreak now compares APR (the code's intent) instead of `BalanceAtStart` (what it actually did). `DebtPayoffMilestone.APRPercent` surfaced in output.
-- **B3/M3**: `Month.AgeOfMoney` and `MonthSummary.AgeOfMoney` changed from `int` to `*int` to preserve the null-vs-zero distinction. `ynab_weekly_checkin.age_of_money_delta_days` now correctly reports a delta of 0 for new plans where `age_of_money=0` legitimately.
-- **B4**: `ynab_status` clamps debt account balances to zero when the user has a credit balance, matching `ynab_debt_snapshot`'s existing behavior.
-- **L2**: Refused redirects log their target URL to stderr for operator debugging (the error returned to MCP clients is still status-only).
-- **L3**: `deltaCache` enforces a per-plan-entry cap of 20,000 items. When hit, the entry is flushed and the next call resets to a fresh delta chain.
-- **L4**: `progressedThisMonth` → `anyProgressFromInitial` (misleading name).
-- **L5**: `ynab_status.savings_accounts` → `liquid_accounts` (see Changed above).
-- **L6**: `debtAccountTypes` lifted from inline literal to package-level `var`.
-- **L9**: `YnabDebtSnapshot.extra_per_month_milliunits` sanity-capped at 1 billion milliunits ($1M USD/month).
-- **L14**: Introduced `clock.go` with an overridable package-level `nowUTC` function. All production time-dependent paths route through it; tests override for determinism via `t.Cleanup`.
-
-Plus a handful of documentation clarifications: M4 (floor-division error magnitude), M6 (cross-category de-dup rationale), M7 (spec-verified `type + scope` combination), L1 (per-Client vs per-token rate limiter wording), L7 (`bearerRe` allowlist rationale), L8 (`list_categories` slice pre-sizing), L10 (month format string style), L11 (`IsSubtransaction` omitempty behavior), L12 (`CreateTransactionOutput.Before *struct{}` rationale), L13 (explicit `ctx.Err()` short-circuit in long task tools).
-
 ## [0.2.0] — 2026-04-04
 
 Major feature release. Adds write tools (opt-in), 5 task-shaped tools,
@@ -63,10 +33,14 @@ complete tool surface.
 
 ### Changed
 
-- **Delta sync** for unfiltered `list_accounts` and `list_transactions`: in-process cache keyed by `(plan_id, endpoint)`, passes `last_knowledge_of_server` on subsequent calls and merges deltas including deletions. Scope limited to unfiltered endpoints per v0.2 brief decision.
-- **`Transaction` output type** gains `PayeeID` field so `ynab_spending_check`'s `excluded_payee_ids` has the data it needs to match.
+- **Delta sync** for unfiltered `list_accounts` and `list_transactions`: in-process cache keyed by `(plan_id, endpoint)`, passes `last_knowledge_of_server` on subsequent calls and merges deltas including deletions. Scope limited to unfiltered endpoints per v0.2 brief decision. Per-entry size cap of 20,000 items; on overflow the entry is flushed and the next call starts a fresh delta chain.
+- **`Transaction` output type** gains `PayeeID` and `TransferAccountID` fields. `PayeeID` unblocks `ynab_spending_check.excluded_payee_ids`; `TransferAccountID` lets task tools exclude transfer-mirror rows from income/outflow aggregations.
 - **`Account` output type** gains `LastReconciledAt *time.Time` for the `ynab_status` days-since-last-reconciled computation.
+- **`Month.AgeOfMoney` and `MonthSummary.AgeOfMoney`** are `*int` (nullable) rather than `int` to preserve YNAB's null-vs-zero distinction — a new plan legitimately has `age_of_money=0` and should not be confused with "YNAB hasn't computed it yet".
+- **`YnabSpendingCheckOutput.OnPlan`** is `*bool` and absent when the aggregation hit its 50,000-row safety ceiling; in that case `Truncated=true` and `VerdictUnavailableReason` explains why no verdict is given. Refusing to give an on_plan answer on incomplete data is the whole point — returning a wrong verdict is worse than returning none.
 - `client.go:doJSON` is now a thin wrapper over `doJSONWithBody` so write and read paths share the same token injection, host lock, rate limiter, and error sanitization.
+- `client.go` introduces an internal `fetchTransactions` / `fetchTransactionsForAggregation` split: the user-facing `list_transactions` keeps its 500-row LLM-context trim for response-size hygiene, while task-shaped tools get the full set (up to the 50,000-row safety ceiling) for correct sum/count math.
+- `clock.go` introduces a package-level `nowUTC` function that all production time-sensitive paths call instead of `time.Now()`. Tests override it via `t.Cleanup` for deterministic dates.
 
 ### Security
 
@@ -112,11 +86,29 @@ Initial release. Read-only MCP server for the YNAB budgeting API.
 - **CI** — `go test -race`, `go vet`, `staticcheck`, `govulncheck`, CodeQL (security-extended + security-and-quality), OpenSSF Scorecard. All workflow actions pinned to commit SHAs for supply-chain integrity. Per-job minimal `permissions:` blocks.
 - **Automated releases** via GoReleaser: cross-platform binaries (Linux/macOS/Windows × amd64/arm64) and multi-arch container images pushed to `ghcr.io/bold-minds/mcp-ynab`.
 
+### Fixed
+
+Correctness issues discovered during internal code review:
+
+- **Silent aggregation truncation**: task tools (`ynab_spending_check`, `ynab_weekly_checkin`, `ynab_status`) previously inherited `ListTransactions`'s 500-row LLM-context trim and could produce wrong totals, wrong on-plan verdicts, and wrong unapproved counts on plans with more than 500 matching transactions in a scope. Now route through a dedicated aggregation helper with a 50,000-row safety ceiling.
+- **Transfer double-counting in `ynab_weekly_checkin`**: transfers between on-budget accounts appear as two mirrored transactions (one positive, one negative). Both sides were being summed into both `income_received` and `total_outflows`, so a $5K checking→savings transfer would inflate both totals by $5K. Transfer rows are now filtered at the aggregation boundary.
+- **Transfer double-counting in `ynab_status.unapproved_transaction_count`**: unapproved transfers counted as 2 pending items instead of 1. Fixed via `countUnapprovedExcludingTransferMirrors`.
+- **Debt credit-balance rendering**: `ynab_status` showed a user with an overpaid credit card as owing negative dollars. Now clamps to zero, matching `ynab_debt_snapshot`'s existing behavior.
+- **Avalanche payoff tiebreak**: `simulateAvalanche`'s same-month tiebreak comment claimed "higher APR first" but the code compared `BalanceAtStart`. Now threads APR through the simulation and uses it as the actual tiebreak.
+- **`age_of_money_delta_days` suppressed legitimate zeros**: presence check used `!= 0` rather than `!= nil`, so a brand-new plan with `age_of_money=0` would never produce a delta. Fixed via the `*int` nullability change above.
+- **`elicitConfirmation` failed open on cancelled contexts**: any `Elicit` error routed to the "client doesn't support elicitation" graceful-degrade path, including `context.Canceled` and `context.DeadlineExceeded`. Now distinguishes cancellation (abort the write) from unsupported-client (log + proceed).
+- **`update_transaction` elicitation message showed UUIDs as names**: rendered "category: Groceries → a1b2c3d4..." making the new side look like a name. Now uses `(new id=...)` labelling to make the asymmetry explicit.
+- **`loadToken` unbounded file read**: `YNAB_API_TOKEN_FILE` was read via `os.ReadFile` with no size limit. A misconfigured path (e.g. `/dev/urandom`) would exhaust memory. Now bounded at 4 KB via `io.LimitReader`.
+- **`YnabDebtSnapshot.extra_per_month_milliunits` had no sanity bound**: a pathological caller passing `math.MaxInt64/2` would not be rejected at the entry point. Now capped at 1 billion milliunits ($1M USD/month) with an actionable error message.
+
 ### Security
 
 - Regression test `TestDoJSON_401DoesNotLeakBearerToken` verifies that a pathological YNAB 401 response with a token embedded in its `detail` field is scrubbed before reaching the MCP client.
-- Regression test `TestLogLeak_PathologicalRoundTripper` verifies that a misbehaving inner HTTP transport that embeds the bearer token literally in its error string produces no token leakage through any of the 7 tool handlers.
+- Regression test `TestLogLeak_PathologicalRoundTripper` covers all 12 currently-registered tools (8 reads + 4 writes) with an adversarial transport that echoes both the Bearer token and the request body in its error. No tool's error path leaks the token.
+- Regression test `TestLogLeak_WriteBodyNotEchoedInError` documents the current sanitize() behavior for user-body content like transaction memos.
 - Subprocess test `TestSubprocess_SDKValidatesMissingRequiredArg` verifies that the MCP SDK rejects tool calls with missing required arguments at the protocol layer (JSON-RPC `-32602`), before any handler code runs.
+- Refused redirects log the attempted target URL to stderr so operators can diagnose "why is YNAB returning 3xx" without the error leaking via MCP-visible surfaces.
+- New regression tests for aggregation truncation bounds, transfer exclusion in both weekly_checkin and status, debt credit-balance clamping, age_of_money null-vs-zero semantics, delta cache size cap, task tool context cancellation short-circuit, and deterministic clock override.
 
 [Unreleased]: https://github.com/bold-minds/mcp-ynab/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/bold-minds/mcp-ynab/releases/tag/v0.2.0
