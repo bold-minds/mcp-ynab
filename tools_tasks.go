@@ -714,6 +714,207 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 }
 
 // ============================================================================
+// ynab_weekly_checkin — 7-day period math vs prior 7 days
+// ============================================================================
+
+// YnabWeeklyCheckinInput asks for a week-over-week comparison ending at
+// as_of_date (defaults to today). The tool returns income, outflow,
+// unapproved, and newly-overspent categories for the current 7-day
+// window plus the prior 7-day window.
+type YnabWeeklyCheckinInput struct {
+	PlanID    string `json:"plan_id" jsonschema:"YNAB plan id, or 'last-used' / 'default'"`
+	AsOfDate  string `json:"as_of_date,omitempty" jsonschema:"end of the period to compare (YYYY-MM-DD); defaults to today (UTC)"`
+}
+
+// PeriodRange is a [start, end] inclusive date range in ISO format.
+type PeriodRange struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// WeeklyMoneyCompare pairs a metric across two adjacent weeks with the
+// delta. All three values use the same sign convention.
+type WeeklyMoneyCompare struct {
+	ThisPeriod  Money `json:"this_period"`
+	PriorPeriod Money `json:"prior_period"`
+	Delta       Money `json:"delta"`
+}
+
+// CategoryOverspendEntry is a category that became overspent in the
+// current period (or was resolved from overspent). Name is included
+// for display.
+type CategoryOverspendEntry struct {
+	CategoryID string `json:"category_id"`
+	Name       string `json:"name"`
+	Overspend  Money  `json:"overspend,omitempty"`
+}
+
+// YnabWeeklyCheckinOutput is the ritual response.
+type YnabWeeklyCheckinOutput struct {
+	Period         PeriodRange        `json:"period"`
+	PriorPeriod    PeriodRange        `json:"prior_period"`
+	IncomeReceived WeeklyMoneyCompare `json:"income_received" jsonschema:"positive inflows categorized to Ready-to-Assign in the period"`
+	TotalOutflows  WeeklyMoneyCompare `json:"total_outflows" jsonschema:"negative amounts (spent) in the period; reported as positive magnitudes in the three fields"`
+
+	// Month-granular fields — see period_grouping_note.
+	CategoriesNewlyOverspentThisMonth []CategoryOverspendEntry `json:"categories_newly_overspent_this_month" jsonschema:"Month-over-month comparison (NOT week-over-week). YNAB's API only exposes category balances at monthly granularity via MonthDetail, so this field uses month scope while other fields in this response use week scope."`
+	CategoriesResolvedFromOverspent   []CategoryOverspendEntry `json:"categories_resolved_from_overspent_this_month"`
+
+	UnapprovedCount     int  `json:"unapproved_count" jsonschema:"current total across the plan, not period-scoped"`
+	AgeOfMoneyDeltaDays *int `json:"age_of_money_delta_days,omitempty" jsonschema:"month-over-month change in age_of_money; null if not computable"`
+
+	// PeriodGroupingNote is a redundant explanation so the LLM cannot
+	// miss the month/week scope mismatch when rendering a summary.
+	PeriodGroupingNote string `json:"period_grouping_note"`
+}
+
+// YnabWeeklyCheckin composes multiple reads to build a week-over-week
+// narrative plus a month-over-month overspent comparison.
+func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, in YnabWeeklyCheckinInput) (*mcp.CallToolResult, YnabWeeklyCheckinOutput, error) {
+	if in.PlanID == "" {
+		return nil, YnabWeeklyCheckinOutput{}, errors.New("plan_id is required")
+	}
+
+	asOf := time.Now().UTC()
+	if in.AsOfDate != "" {
+		parsed, err := time.Parse("2006-01-02", in.AsOfDate)
+		if err != nil {
+			return nil, YnabWeeklyCheckinOutput{}, errors.New("as_of_date must be YYYY-MM-DD")
+		}
+		asOf = parsed
+	}
+
+	// Define the two 7-day windows. Current = [asOf-6, asOf]; prior =
+	// [asOf-13, asOf-7]. Both inclusive on both ends.
+	thisEnd := asOf
+	thisStart := asOf.AddDate(0, 0, -6)
+	priorEnd := asOf.AddDate(0, 0, -7)
+	priorStart := asOf.AddDate(0, 0, -13)
+
+	thisStartStr := thisStart.Format("2006-01-02")
+	thisEndStr := thisEnd.Format("2006-01-02")
+	priorStartStr := priorStart.Format("2006-01-02")
+	priorEndStr := priorEnd.Format("2006-01-02")
+
+	out := YnabWeeklyCheckinOutput{
+		Period:      PeriodRange{Start: thisStartStr, End: thisEndStr},
+		PriorPeriod: PeriodRange{Start: priorStartStr, End: priorEndStr},
+		PeriodGroupingNote: "categories_newly_overspent_this_month compares current month to prior month " +
+			"(YNAB's API does not expose category balances at day granularity); all other fields are week-granular.",
+	}
+
+	// Fetch transactions from priorStart onward in a single call, then
+	// filter client-side into the two windows.
+	_, txnsOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
+		PlanID:    in.PlanID,
+		SinceDate: priorStartStr,
+		Limit:     500,
+	})
+	if err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
+	}
+
+	var thisInflow, priorInflow int64
+	var thisOutflow, priorOutflow int64
+	for _, t := range txnsOut.Transactions {
+		if t.Date < priorStartStr || t.Date > thisEndStr {
+			continue
+		}
+		inThis := t.Date >= thisStartStr && t.Date <= thisEndStr
+		inPrior := t.Date >= priorStartStr && t.Date <= priorEndStr
+		amt := t.Amount.Milliunits
+		if inThis {
+			if amt > 0 {
+				thisInflow += amt
+			} else {
+				thisOutflow += -amt
+			}
+		} else if inPrior {
+			if amt > 0 {
+				priorInflow += amt
+			} else {
+				priorOutflow += -amt
+			}
+		}
+	}
+
+	out.IncomeReceived = WeeklyMoneyCompare{
+		ThisPeriod:  NewMoney(thisInflow),
+		PriorPeriod: NewMoney(priorInflow),
+		Delta:       NewMoney(thisInflow - priorInflow),
+	}
+	out.TotalOutflows = WeeklyMoneyCompare{
+		ThisPeriod:  NewMoney(thisOutflow),
+		PriorPeriod: NewMoney(priorOutflow),
+		Delta:       NewMoney(thisOutflow - priorOutflow),
+	}
+
+	// Unapproved count across the plan (not period-scoped).
+	_, unapprovedOut, err := c.ListTransactions(ctx, nil, ListTransactionsInput{
+		PlanID: in.PlanID, Type: "unapproved", Limit: 500,
+	})
+	if err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
+	}
+	out.UnapprovedCount = len(unapprovedOut.Transactions)
+
+	// Month-over-month newly-overspent comparison. Fetch current and
+	// prior month, compare category balance signs.
+	// YNAB months are always the first of the month in ISO format
+	// (YYYY-MM-01). Build explicitly via fmt because "2006-01-01" as a
+	// Go time format would be ambiguous (01 is the month reference).
+	y, m, _ := asOf.Date()
+	currentMonthDate := fmt.Sprintf("%04d-%02d-01", y, int(m))
+	prior := asOf.AddDate(0, -1, 0)
+	py, pm, _ := prior.Date()
+	priorMonthDate := fmt.Sprintf("%04d-%02d-01", py, int(pm))
+
+	_, curMonthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: currentMonthDate})
+	if err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
+	}
+	_, priorMonthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: priorMonthDate})
+	if err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
+	}
+	priorOverspentByID := make(map[string]bool)
+	for _, cat := range priorMonthOut.Categories {
+		if cat.Balance.Milliunits < 0 && cat.GroupName != ynabStatusCreditCardPaymentGroupName {
+			priorOverspentByID[cat.ID] = true
+		}
+	}
+	for _, cat := range curMonthOut.Categories {
+		if cat.GroupName == ynabStatusCreditCardPaymentGroupName {
+			continue
+		}
+		currentlyOverspent := cat.Balance.Milliunits < 0
+		wasOverspentLastMonth := priorOverspentByID[cat.ID]
+		switch {
+		case currentlyOverspent && !wasOverspentLastMonth:
+			out.CategoriesNewlyOverspentThisMonth = append(out.CategoriesNewlyOverspentThisMonth, CategoryOverspendEntry{
+				CategoryID: cat.ID,
+				Name:       cat.Name,
+				Overspend:  NewMoney(-cat.Balance.Milliunits),
+			})
+		case !currentlyOverspent && wasOverspentLastMonth:
+			out.CategoriesResolvedFromOverspent = append(out.CategoriesResolvedFromOverspent, CategoryOverspendEntry{
+				CategoryID: cat.ID,
+				Name:       cat.Name,
+			})
+		}
+	}
+
+	// age_of_money delta (month-granular; explicitly null if either
+	// month's value isn't available).
+	if curMonthOut.AgeOfMoney != 0 && priorMonthOut.AgeOfMoney != 0 {
+		delta := curMonthOut.AgeOfMoney - priorMonthOut.AgeOfMoney
+		out.AgeOfMoneyDeltaDays = &delta
+	}
+
+	return nil, out, nil
+}
+
+// ============================================================================
 // ynab_spending_check — did the user stay on plan in a date range?
 // ============================================================================
 

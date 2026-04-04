@@ -551,6 +551,13 @@ func registerTools(server *mcp.Server, c *Client) {
 		Annotations: readOnly,
 	}, c.YnabStatus)
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "ynab_weekly_checkin",
+		Title:       "Weekly check-in with prior-period comparison",
+		Description: "Week-over-week comparison of income and outflows ending at as_of_date (default: today). Includes a period_grouping_note explaining that categories_newly_overspent_this_month is MONTH-granular (YNAB's API only exposes category balances at monthly granularity), while other fields are week-granular.",
+		Annotations: readOnly,
+	}, c.YnabWeeklyCheckin)
+
 	// Write tools — registered ONLY when YNAB_ALLOW_WRITES=1 at startup.
 	// When the environment variable is unset, these tools do not appear
 	// in tools/list output and the LLM cannot call them at all. Every
