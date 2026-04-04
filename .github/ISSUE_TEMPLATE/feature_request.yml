@@ -1,0 +1,47 @@
+name: Feature request
+description: Suggest a new tool, new argument, or new behavior
+title: "feat: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an enhancement. A few notes up front:
+
+        - **Write tools** (creating/modifying/deleting YNAB data) are planned for v0.2 behind `YNAB_ALLOW_WRITES=1`. See the Roadmap in [README.md](https://github.com/bold-minds/mcp-ynab/blob/main/README.md). Feature requests for specific write tools are welcome; requests to enable writes in v0.1.x will be closed.
+        - Check [CHANGELOG.md](https://github.com/bold-minds/mcp-ynab/blob/main/CHANGELOG.md) and open issues first to avoid duplicates.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today? What conversation with an LLM do you want to have that this server does not yet support?
+      placeholder: "I want the LLM to tell me how much I spent on restaurants this quarter, but I can only query one category or one date range at a time."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you add or change? A new tool? A new argument on an existing tool? Rough shape is fine.
+      placeholder: |
+        Add a `sum_spending` tool that takes `plan_id`, `category_ids[]`, `start_date`, `end_date`, and returns a single Money total per category.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other options did you think about? What would you do today as a workaround?
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Related issues, upstream YNAB API features, or anything else.
+    validations:
+      required: false

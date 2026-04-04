@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.6
+#
+# Minimal Dockerfile used by GoReleaser for release-time image builds.
+# GoReleaser has already cross-compiled the static binary; this Dockerfile
+# only needs to wrap it in a distroless runtime image. The multi-stage
+# build-from-source version lives in ./Dockerfile and is used for direct
+# `docker build` against the repo.
+#
+# GoReleaser's Docker build context contains:
+#   - mcp-ynab            (the prebuilt binary for the target arch)
+#   - Dockerfile.goreleaser (this file)
+# Nothing else. Do not COPY any source files here.
+#
+# FROM is pinned by digest so Scorecard's PinnedDependencies check passes.
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:a9329520abc449e3b14d5bc3a6ffae065bdde0f02667fa10880c49b35c109fd1
+COPY mcp-ynab /usr/local/bin/mcp-ynab
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/mcp-ynab"]
