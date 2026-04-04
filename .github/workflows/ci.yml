@@ -58,10 +58,10 @@ jobs:
           go-version: '1.25.x'
           check-latest: true
       - name: Install staticcheck
-        # Pinned to a concrete release tag so Scorecard's PinnedDependencies
-        # check is satisfied and upstream can't silently ship a different
-        # binary under @latest. Dependabot tracks go module updates.
-        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+        # Pinned to a commit SHA because Scorecard's PinnedDependencies
+        # check doesn't recognize honnef's non-semver tag format (2026.1).
+        # SHA corresponds to the 2026.1 release tag.
+        run: go install honnef.co/go/tools/cmd/staticcheck@ff63afafc529279f454e02f1d060210bd4263951
       - run: staticcheck ./...
 
   govulncheck:
