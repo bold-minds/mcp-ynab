@@ -38,6 +38,7 @@
 package main
 
 import (
+	"log"
 	"sync"
 )
 
@@ -117,7 +118,14 @@ func (c *deltaCache[T]) merge(
 	deletedFn func(T) bool,
 ) []T {
 	if c == nil {
-		return deltas
+		// Return a fresh slice to match the caching path's contract
+		// (populated branch allocates, nil branch aliased caller's
+		// slice). Returning an alias here made callers silently mutate
+		// upstream state if they sorted or filtered the result in
+		// place. Review finding on delta.go:121 aliasing asymmetry.
+		out := make([]T, len(deltas))
+		copy(out, deltas)
+		return out
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -138,6 +146,15 @@ func (c *deltaCache[T]) merge(
 	// and then partially applied deltas with a zeroed knowledge, leaking
 	// stale state. Review finding M1.
 	if s.knowledge > 0 && newKnowledge < s.knowledge {
+		// Log the freeze so operators watching for "why does nothing
+		// seem to update" have a breadcrumb. Previously the regression
+		// was silent and the cache simply froze indefinitely. Review
+		// finding on delta.go:140 silent knowledge regression.
+		log.Printf(
+			"ynab delta: server_knowledge regression for plan=%s (cached=%d, received=%d); "+
+				"returning cached full set without applying deltas",
+			planID, s.knowledge, newKnowledge,
+		)
 		out := make([]T, 0, len(s.items))
 		for _, item := range s.items {
 			out = append(out, item)

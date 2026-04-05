@@ -121,7 +121,7 @@ Three options, in order of preference. The server checks them in the order below
 Store the token once in your operating system's native credential store (macOS Keychain, Linux Secret Service, Windows Credential Manager):
 
 ```bash
-echo -n "your-ynab-personal-access-token" | mcp-ynab store-token
+printf '%s' "your-ynab-personal-access-token" | mcp-ynab store-token
 ```
 
 The token is read from stdin — it never appears on the command line, so it never lands in shell history or `/proc/PID/cmdline`. Subsequent runs of `mcp-ynab` pick it up automatically with no environment variables needed.
@@ -205,12 +205,12 @@ Any client that speaks the MCP stdio transport can launch `mcp-ynab` as a subpro
 
 | Threat                                                                      | Mitigation                                                                                                                                                |
 | --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Prompt-injected instructions telling the LLM to delete/modify financial data | **No write tools exist.** There is no code path that issues a `POST`, `PATCH`, `PUT`, or `DELETE` to YNAB.                                                |
+| Prompt-injected instructions telling the LLM to delete/modify financial data | Write tools are gated behind `YNAB_ALLOW_WRITES=1` (opt-in at startup) and every write elicits a per-call confirmation plus a $10K safety cap with echo-back override. When the env var is unset, no write tool is registered and no `POST`/`PATCH`/`PUT` code path can be reached. |
 | Token leakage via log statements / `%+v` on a config struct                 | Token is wrapped in a redacting `Token` type. `String`, `GoString`, `Format`, `MarshalJSON`, `MarshalText` all return `[REDACTED]`. Raw value only accessible via a package-private `reveal()` called in exactly ONE place. |
 | Token leakage via HTTP-client errors (axios-style config-in-error pattern)  | Adversarial regression test: pathological RoundTripper returns errors containing the literal token; every tool's error path is asserted not to echo it.  |
 | Exfiltration of the YNAB token via a rogue URL (SSRF / spec injection)       | Custom `http.RoundTripper` refuses any request whose hostname is not `api.ynab.com` (case-insensitive, port-tolerant). Strips `Authorization` defensively. Refuses all redirects. |
 | Token leakage via YNAB error responses surfaced to the LLM                  | All YNAB errors go through `sanitize()`, which strips `Bearer <token>` and `Authorization:` patterns. No code path formats the raw token into an error.  |
-| Runaway LLM exhausting YNAB's per-token rate limit (200 req/hour)            | Token-bucket rate limiter: 1 request per 20 seconds refill rate with a burst of 10 (max 190 calls/hour steady-state). Enforced in the RoundTripper.        |
+| Runaway LLM exhausting YNAB's per-token rate limit (200 req/hour)            | Token-bucket rate limiter: refill of 1 request per 20 seconds with a burst of 10. Peak: 10 burst + 3600/20 refill = 190 calls in the first hour. Steady-state after the burst drains: 180 calls/hour (3600/20). Enforced in the RoundTripper. |
 | Unbounded write access by an LLM with credentials                            | **Write tools are opt-in.** Unless `YNAB_ALLOW_WRITES=1` is set at MCP server startup, write tools are not registered at all and cannot be invoked. When writes are enabled, every write goes through an MCP elicitation confirmation, an amount safety cap with echo-back override for >$10K transactions, and returns before/after state in the response so the calling skill can persist an audit record. |
 | Wrong-amount updates on existing transactions                                | `update_transaction` has no amount field on its input struct — amount changes are structurally impossible via this tool. Regression test enforces the field's absence via reflection.                                                    |
 | Hung upstream                                                                | 30-second per-request timeout, 8 MB response body cap.                                                                                                    |

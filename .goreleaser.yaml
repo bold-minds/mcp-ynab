@@ -6,7 +6,15 @@ project_name: mcp-ynab
 
 before:
   hooks:
-    - go mod tidy
+    # `go mod verify` confirms go.sum hashes match the downloaded module
+    # cache; it does NOT mutate go.mod or go.sum at release time. The
+    # previous `go mod tidy` hook rewrote go.sum mid-release, which meant
+    # the artifact built from the release run could embed a sum set
+    # different from the committed tree. CI runs `go mod tidy && git
+    # diff --exit-code` on every PR to keep go.sum current, so the
+    # release hook was both racy and redundant. Review finding on
+    # goreleaser before.hooks tidy mutation.
+    - go mod verify
 
 builds:
   - id: mcp-ynab

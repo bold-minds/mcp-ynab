@@ -37,7 +37,7 @@ body:
     attributes:
       label: mcp-ynab version
       description: Output of `mcp-ynab version`
-      placeholder: "v0.1.0"
+      placeholder: "v0.2.0"
     validations:
       required: true
 

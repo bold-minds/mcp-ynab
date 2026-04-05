@@ -83,7 +83,21 @@ func startSessionWithEnv(t *testing.T, bin string, extraEnv []string) *mcpSessio
 	// execution would hit the rate limiter then fail HTTP, which is also
 	// fine for assertion purposes.
 	cmd := exec.Command(bin)
-	cmd.Env = append(cmd.Environ(), "YNAB_API_TOKEN=sk-subprocess-test")
+	// Filter YNAB_ALLOW_WRITES out of the inherited environment. A dev or
+	// CI box that exports YNAB_ALLOW_WRITES=1 globally would otherwise
+	// silently bypass TestSubprocess_WritesGatedOffWhenEnvUnset — the one
+	// test that pins the bimodal startup gate. We explicitly re-add the
+	// variable only when a caller passes it in extraEnv. Review finding
+	// on test hermeticity.
+	parent := cmd.Environ()
+	filtered := parent[:0]
+	for _, kv := range parent {
+		if strings.HasPrefix(kv, "YNAB_ALLOW_WRITES=") {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	cmd.Env = append(filtered, "YNAB_API_TOKEN=sk-subprocess-test")
 	cmd.Env = append(cmd.Env, extraEnv...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

@@ -28,8 +28,10 @@ Clone and install dev tools:
 git clone https://github.com/bold-minds/mcp-ynab
 cd mcp-ynab
 go mod download
-go install honnef.co/go/tools/cmd/staticcheck@latest
-go install golang.org/x/vuln/cmd/govulncheck@latest
+# Pins match CI (.github/workflows/ci.yml). Installing by SHA avoids the
+# "works on my machine, breaks on CI" drift that comes from @latest.
+go install honnef.co/go/tools/cmd/staticcheck@ff63afafc529279f454e02f1d060210bd4263951
+go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 ```
 
 ## Running checks locally
@@ -48,7 +50,7 @@ The subprocess tests (`subprocess_test.go`) build a real binary and speak JSON-R
 ## Running the server locally
 
 ```bash
-echo -n "your-ynab-personal-access-token" | go run . store-token   # one-time
+printf '%s' "your-ynab-personal-access-token" | go run . store-token   # one-time
 go run .                                                           # stdio server
 ```
 

@@ -111,6 +111,14 @@ func FuzzFrequencyOccurrences(f *testing.F) {
 		if winEnd < -maxDays || winEnd > maxDays {
 			return
 		}
+		// FrequencyOccurrences returns nil when winEnd < winStart, which
+		// is a no-op path the fuzzer gains nothing from exploring. Skip
+		// those inputs so the corpus focuses on well-ordered windows
+		// where the output contract actually has something to verify.
+		// Review finding on fuzz_test clamp.
+		if winStart > winEnd {
+			return
+		}
 		base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 		dn := base.AddDate(0, 0, int(offset))
 		ws := base.AddDate(0, 0, int(winStart))

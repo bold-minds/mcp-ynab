@@ -103,10 +103,17 @@ func loadToken() (Token, error) {
 		}
 		return NewToken(raw), nil
 	}
-	// Keyring fallback. Errors here are expected in some environments
-	// (no Secret Service running, no Keychain access). We wrap the error
-	// with a user-facing hint so the message tells the user what to do,
-	// not just that it failed.
+	// Keyring fallback. We distinguish three cases instead of collapsing
+	// everything into "no token found":
+	//
+	//  - keyring.ErrNotFound: the keyring is available but has no entry.
+	//    Prompt the user to set YNAB_API_TOKEN or run `store-token`.
+	//  - other keyring error: the keyring is unavailable (D-Bus down,
+	//    Keychain locked, user cancelled). Surface the underlying error
+	//    so the user can fix the keyring rather than entering an
+	//    onboarding loop that keeps saying "no token found". Review
+	//    finding on client.go:85 loadToken.
+	//  - success but empty: explicit "keyring entry is empty" message.
 	raw, err := keyring.Get(keyringService, keyringUser)
 	if err == nil {
 		raw = strings.TrimSpace(raw)
@@ -115,9 +122,16 @@ func loadToken() (Token, error) {
 		}
 		return Token{}, errors.New("keyring entry is empty")
 	}
-	return Token{}, errors.New(
-		"no YNAB token found. Set YNAB_API_TOKEN, or YNAB_API_TOKEN_FILE, " +
-			"or run 'mcp-ynab store-token' to store one in the OS keyring",
+	if errors.Is(err, keyring.ErrNotFound) {
+		return Token{}, errors.New(
+			"no YNAB token found. Set YNAB_API_TOKEN, or YNAB_API_TOKEN_FILE, " +
+				"or run 'mcp-ynab store-token' to store one in the OS keyring",
+		)
+	}
+	return Token{}, fmt.Errorf(
+		"keyring unavailable: %w. Set YNAB_API_TOKEN or YNAB_API_TOKEN_FILE "+
+			"as an environment-variable fallback, or fix the keyring and retry",
+		err,
 	)
 }
 
@@ -215,12 +229,7 @@ func NewClient(token Token) (*Client, error) {
 			// secrets in URLs, so req.URL contains no tokens. The error
 			// returned to the MCP client remains status-only via
 			// apiError. Review finding L2.
-			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-				if req != nil && req.URL != nil {
-					log.Printf("ynab: refused redirect to %q (all redirects blocked to prevent Authorization forwarding)", req.URL.String())
-				}
-				return http.ErrUseLastResponse
-			},
+			CheckRedirect: logAndRefuseRedirect,
 		},
 		token:             token,
 		baseURL:           ynabBaseURL,
@@ -255,7 +264,13 @@ func (c *Client) doJSON(ctx context.Context, path string, query url.Values, out 
 // decoded from the response body; callers may pass nil if they do not need
 // the response (e.g. for write tools that only care about success).
 func (c *Client) doJSONWithBody(ctx context.Context, method, path string, query url.Values, body, out any) error {
-	if strings.Contains(path, "://") {
+	// Tighten the absolute-URL guard: strings.Contains(path, "://") missed
+	// "//evil.com", "?evil.com", fragment-only forms, and CRLF-smuggled
+	// headers. Require the path to start with "/" and contain no
+	// scheme-relative or control characters. Review finding on
+	// doJSONWithBody absolute-URL check.
+	if path == "" || path[0] != '/' || strings.HasPrefix(path, "//") ||
+		strings.ContainsAny(path, "\r\n") || strings.Contains(path, "://") {
 		return errors.New("ynab: absolute URL not allowed")
 	}
 	reqURL := c.baseURL + path
@@ -310,12 +325,45 @@ func (c *Client) doJSONWithBody(ctx context.Context, method, path string, query 
 		return nil
 	}
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	// Read one byte past the cap so we can distinguish "response at cap"
+	// (exactly maxResponseBytes) from "response truncated by cap". A silent
+	// truncation produced an "unexpected end of JSON input" error with no
+	// indication the cap fired, leaving operators chasing a phantom YNAB
+	// bug. Review finding on client.go:313.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return fmt.Errorf("ynab: read response: %w", err)
+	}
+	if int64(len(respBody)) > maxResponseBytes {
+		return fmt.Errorf(
+			"ynab: response exceeded %d-byte client cap (maxResponseBytes); raise the cap in client.go if a legitimate YNAB response exceeds it",
+			maxResponseBytes,
+		)
 	}
 	if err := json.Unmarshal(respBody, out); err != nil {
 		return fmt.Errorf("ynab: decode response: %w", err)
 	}
 	return nil
+}
+
+// logAndRefuseRedirect is the http.Client CheckRedirect callback: it
+// always returns http.ErrUseLastResponse so the body/status of the 3xx
+// is returned as-is, and it logs the refused target URL for operators.
+// The target URL is passed through sanitize() in case an attacker
+// controlled a redirect Location field containing bearer-shaped text
+// (e.g. a reflected query param). Review findings on client.go:218.
+func logAndRefuseRedirect(req *http.Request, _ []*http.Request) error {
+	if req != nil && req.URL != nil {
+		// Cap the logged URL length so a giant attacker-controlled
+		// redirect target cannot flood operator logs. 512 chars is far
+		// beyond any legitimate YNAB URL and short enough to stay on a
+		// single log line on typical terminals.
+		raw := req.URL.String()
+		const maxLogURL = 512
+		if len(raw) > maxLogURL {
+			raw = raw[:maxLogURL] + "…(truncated)"
+		}
+		log.Printf("ynab: refused redirect to %q (all redirects blocked to prevent Authorization forwarding)", sanitize(raw))
+	}
+	return http.ErrUseLastResponse
 }

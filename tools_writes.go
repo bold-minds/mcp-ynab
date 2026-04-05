@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -271,16 +272,29 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if err := requireWriteAllowed(); err != nil {
 		return nil, CreateTransactionOutput{}, sanitizedErr(err)
 	}
-	if in.PlanID == "" {
-		return nil, CreateTransactionOutput{}, errors.New("plan_id is required")
+	if err := validateIDShape(in.PlanID); err != nil {
+		return nil, CreateTransactionOutput{}, errors.New("plan_id: " + err.Error())
 	}
-	if in.AccountID == "" {
-		return nil, CreateTransactionOutput{}, errors.New("account_id is required")
+	if err := validateIDShape(in.AccountID); err != nil {
+		return nil, CreateTransactionOutput{}, errors.New("account_id: " + err.Error())
+	}
+	if in.CategoryID != "" {
+		if err := validateIDShape(in.CategoryID); err != nil {
+			return nil, CreateTransactionOutput{}, errors.New("category_id: " + err.Error())
+		}
+	}
+	if in.PayeeID != "" {
+		if err := validateIDShape(in.PayeeID); err != nil {
+			return nil, CreateTransactionOutput{}, errors.New("payee_id: " + err.Error())
+		}
 	}
 	if in.PayeeName == "" && in.PayeeID == "" {
 		return nil, CreateTransactionOutput{}, errors.New("one of payee_name or payee_id is required")
 	}
-	if in.Memo != "" && len(in.Memo) > 200 {
+	// Memo length measured in runes, not bytes — so a multi-byte CJK or
+	// emoji memo is accepted up to 200 user-visible characters. Review
+	// finding on memo length byte-vs-rune.
+	if in.Memo != "" && utf8.RuneCountInString(in.Memo) > 200 {
 		return nil, CreateTransactionOutput{}, errors.New("memo must be at most 200 characters")
 	}
 	if in.ImportID != "" && len(in.ImportID) > 36 {
@@ -444,11 +458,11 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	if err := requireWriteAllowed(); err != nil {
 		return nil, UpdateCategoryBudgetedOutput{}, sanitizedErr(err)
 	}
-	if in.PlanID == "" {
-		return nil, UpdateCategoryBudgetedOutput{}, errors.New("plan_id is required")
+	if err := validateIDShape(in.PlanID); err != nil {
+		return nil, UpdateCategoryBudgetedOutput{}, errors.New("plan_id: " + err.Error())
 	}
-	if in.CategoryID == "" {
-		return nil, UpdateCategoryBudgetedOutput{}, errors.New("category_id is required")
+	if err := validateIDShape(in.CategoryID); err != nil {
+		return nil, UpdateCategoryBudgetedOutput{}, errors.New("category_id: " + err.Error())
 	}
 	month := in.Month
 	if month == "" {
@@ -463,9 +477,6 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	// documented value. Review finding H4.
 	if month == "current" {
 		month = nowUTC().Format("2006-01") + "-01"
-	}
-	if err := checkAmountBound(in.NewBudgetedMilliunits, in.AmountOverrideMilliunits); err != nil {
-		return nil, UpdateCategoryBudgetedOutput{}, sanitizedErr(err)
 	}
 
 	basePath := "/plans/" + url.PathEscape(in.PlanID) +
@@ -490,9 +501,28 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	// and would otherwise land in elicitation logs. The user can verify
 	// the category by its name alone. Review finding M10.
 	delta := in.NewBudgetedMilliunits - beforeWire.Data.Category.Budgeted
+
+	// Safety cap guards the DELTA, not the target value. Moving $50K
+	// between categories can leave both new totals under the $10K target
+	// threshold while still shifting $50K of money around — so we must
+	// gate on |new - before|. Computed after the before-snapshot fetch
+	// because delta depends on YNAB's actual state. Review finding H1.
+	if err := checkAmountBound(delta, in.AmountOverrideMilliunits); err != nil {
+		return nil, UpdateCategoryBudgetedOutput{}, sanitizedErr(err)
+	}
+	// Include plan_id and month in the confirmation so a user with
+	// multiple plans or mid-year shifts sees exactly which plan/month
+	// is being mutated. The category name is truncated to guard against
+	// a plan-import that created a multi-kilobyte category name — the
+	// elicitation prompt is rendered verbatim by the MCP client and an
+	// unbounded name would mangle the UI. Review finding on
+	// UpdateCategoryBudgeted elicitation missing plan_id/month and on
+	// unbounded display strings in prompts.
 	msg := fmt.Sprintf(
-		"Update YNAB category budgeted: %q from %s to %s (change: %s)",
-		beforeWire.Data.Category.Name,
+		"Update YNAB category budgeted in plan %s, month %s: %q from %s to %s (change: %s)",
+		in.PlanID,
+		month,
+		truncateForDisplay(beforeWire.Data.Category.Name, 80),
 		formatSignedMoney(beforeWire.Data.Category.Budgeted),
 		formatSignedMoney(in.NewBudgetedMilliunits),
 		formatSignedMoney(delta),
@@ -534,11 +564,11 @@ func (c *Client) UpdateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if err := requireWriteAllowed(); err != nil {
 		return nil, UpdateTransactionOutput{}, sanitizedErr(err)
 	}
-	if in.PlanID == "" {
-		return nil, UpdateTransactionOutput{}, errors.New("plan_id is required")
+	if err := validateIDShape(in.PlanID); err != nil {
+		return nil, UpdateTransactionOutput{}, errors.New("plan_id: " + err.Error())
 	}
-	if in.TransactionID == "" {
-		return nil, UpdateTransactionOutput{}, errors.New("transaction_id is required")
+	if err := validateIDShape(in.TransactionID); err != nil {
+		return nil, UpdateTransactionOutput{}, errors.New("transaction_id: " + err.Error())
 	}
 
 	// Validate mutable field subset and collect the non-nil ones for the
@@ -548,11 +578,15 @@ func (c *Client) UpdateTransaction(ctx context.Context, req *mcp.CallToolRequest
 		return nil, UpdateTransactionOutput{}, errors.New("at least one field must be specified to update")
 	}
 
-	// Length and enum validations.
-	if in.PayeeName != nil && len(*in.PayeeName) > 200 {
+	// Length checks operate on runes, not bytes. The docs and the error
+	// message both say "200 characters" and "500 characters"; a
+	// byte-based len() would reject a legitimate CJK/emoji memo at ~67
+	// runes while the limit says 200. Review finding on memo length
+	// byte-vs-rune.
+	if in.PayeeName != nil && utf8.RuneCountInString(*in.PayeeName) > 200 {
 		return nil, UpdateTransactionOutput{}, errors.New("payee_name must be at most 200 characters")
 	}
-	if in.Memo != nil && len(*in.Memo) > 500 {
+	if in.Memo != nil && utf8.RuneCountInString(*in.Memo) > 500 {
 		return nil, UpdateTransactionOutput{}, errors.New("memo must be at most 500 characters")
 	}
 	if in.Cleared != nil {
@@ -586,11 +620,11 @@ func (c *Client) ApproveTransaction(ctx context.Context, req *mcp.CallToolReques
 	if err := requireWriteAllowed(); err != nil {
 		return nil, UpdateTransactionOutput{}, sanitizedErr(err)
 	}
-	if in.PlanID == "" {
-		return nil, UpdateTransactionOutput{}, errors.New("plan_id is required")
+	if err := validateIDShape(in.PlanID); err != nil {
+		return nil, UpdateTransactionOutput{}, errors.New("plan_id: " + err.Error())
 	}
-	if in.TransactionID == "" {
-		return nil, UpdateTransactionOutput{}, errors.New("transaction_id is required")
+	if err := validateIDShape(in.TransactionID); err != nil {
+		return nil, UpdateTransactionOutput{}, errors.New("transaction_id: " + err.Error())
 	}
 	approved := true
 	return c.doUpdateTransaction(ctx, req, UpdateTransactionInput{
@@ -607,16 +641,40 @@ func (c *Client) ApproveTransaction(ctx context.Context, req *mcp.CallToolReques
 func (c *Client) doUpdateTransaction(ctx context.Context, req *mcp.CallToolRequest, in UpdateTransactionInput, elicit bool) (*mcp.CallToolResult, UpdateTransactionOutput, error) {
 	basePath := "/plans/" + url.PathEscape(in.PlanID) + "/transactions/" + url.PathEscape(in.TransactionID)
 
+	// Collect caller-supplied fields that could echo back through an
+	// error surface (a pathological proxy reflecting the request body,
+	// YNAB validation-error.detail containing the memo, etc.). Passed to
+	// sanitizedErrWith on every error path in this handler so the memo
+	// and payee_name scrub symmetrically with CreateTransaction — the
+	// prior asymmetry meant UpdateTransaction leaked memos while
+	// CreateTransaction scrubbed them. Review finding on sanitizedErrWith
+	// asymmetry.
+	redactMemo := deref(in.Memo)
+	redactPayee := deref(in.PayeeName)
+
 	// Fetch current state for the "before" snapshot.
 	var beforeWire wireTransactionResponse
 	if err := c.doJSON(ctx, basePath, nil, &beforeWire); err != nil {
-		return nil, UpdateTransactionOutput{}, sanitizedErr(err)
+		return nil, UpdateTransactionOutput{}, sanitizedErrWith(err, redactMemo, redactPayee)
+	}
+
+	// Reject a no-op update and a deleted-transaction update before
+	// issuing the PUT. A no-op update would prompt the user, send a
+	// PATCH that changes nothing, and audit the non-change — all noise.
+	// A deleted-transaction update would trigger a confusing YNAB 400
+	// and leave the audit trail implying the tool tried to modify a
+	// tombstone. Review finding on no-op / deleted-tx short-circuit.
+	if beforeWire.Data.Transaction.Deleted {
+		return nil, UpdateTransactionOutput{}, errors.New("transaction is deleted; cannot update a tombstoned transaction")
+	}
+	if isUpdateNoOp(beforeWire.Data.Transaction, in) {
+		return nil, UpdateTransactionOutput{}, errors.New("update is a no-op: every specified field already matches the current value")
 	}
 
 	if elicit {
 		msg := buildUpdateTransactionElicitMessage(beforeWire.Data.Transaction, in)
 		if err := elicitConfirmation(ctx, req.Session, msg); err != nil {
-			return nil, UpdateTransactionOutput{}, sanitizedErr(err)
+			return nil, UpdateTransactionOutput{}, sanitizedErrWith(err, redactMemo, redactPayee)
 		}
 	}
 
@@ -635,7 +693,7 @@ func (c *Client) doUpdateTransaction(ctx context.Context, req *mcp.CallToolReque
 
 	var afterWire wireTransactionResponse
 	if err := c.doJSONWithBody(ctx, http.MethodPut, basePath, nil, body, &afterWire); err != nil {
-		return nil, UpdateTransactionOutput{}, sanitizedErr(err)
+		return nil, UpdateTransactionOutput{}, sanitizedErrWith(err, redactMemo, redactPayee)
 	}
 
 	return nil, UpdateTransactionOutput{
@@ -717,20 +775,26 @@ func buildTransactionSnapshotAfter(after wireTransaction, in UpdateTransactionIn
 // "(new id=...)" to set the user's expectation that they are verifying
 // an ID change, not a name change. Review finding M2.
 func buildUpdateTransactionElicitMessage(before wireTransaction, in UpdateTransactionInput) string {
+	// Display caps. Memos can legally reach 500 chars and payee names can
+	// be arbitrarily long on plans imported from other tools; embedding
+	// them verbatim would balloon the elicitation prompt the MCP client
+	// renders. Truncate to 80 chars per field with an ellipsis suffix so
+	// the prompt stays compact while preserving enough text for the user
+	// to verify what they are confirming. Review finding on unbounded
+	// elicitation strings.
+	const shortMax = 80
+	const memoMax = 120
 	var changes []string
 	if in.CategoryID != nil {
-		changes = append(changes, fmt.Sprintf("category: %s → (new id=%s)", deref(before.CategoryName), *in.CategoryID))
+		changes = append(changes, fmt.Sprintf("category: %s → (new id=%s)", truncateForDisplay(deref(before.CategoryName), shortMax), *in.CategoryID))
 	}
-	// PayeeID takes precedence when both are set (YNAB resolves name via
-	// the id); render only one line in that case to avoid a confusing
-	// double-change summary during elicitation.
 	if in.PayeeID != nil {
-		changes = append(changes, fmt.Sprintf("payee: %s → (new id=%s)", deref(before.PayeeName), *in.PayeeID))
+		changes = append(changes, fmt.Sprintf("payee: %s → (new id=%s)", truncateForDisplay(deref(before.PayeeName), shortMax), *in.PayeeID))
 	} else if in.PayeeName != nil {
-		changes = append(changes, fmt.Sprintf("payee_name: %q → %q", deref(before.PayeeName), *in.PayeeName))
+		changes = append(changes, fmt.Sprintf("payee_name: %q → %q", truncateForDisplay(deref(before.PayeeName), shortMax), truncateForDisplay(*in.PayeeName, shortMax)))
 	}
 	if in.Memo != nil {
-		changes = append(changes, fmt.Sprintf("memo: %q → %q", deref(before.Memo), *in.Memo))
+		changes = append(changes, fmt.Sprintf("memo: %q → %q", truncateForDisplay(deref(before.Memo), memoMax), truncateForDisplay(*in.Memo, memoMax)))
 	}
 	if in.Approved != nil {
 		changes = append(changes, fmt.Sprintf("approved: %v → %v", before.Approved, *in.Approved))
@@ -750,9 +814,26 @@ func buildUpdateTransactionElicitMessage(before wireTransaction, in UpdateTransa
 		in.TransactionID,
 		formatSignedMoney(before.Amount),
 		before.Date,
-		deref(before.PayeeName),
+		truncateForDisplay(deref(before.PayeeName), shortMax),
 		summary,
 	)
+}
+
+// truncateForDisplay returns s bounded to max runes (NOT bytes), appending
+// an ellipsis when truncation occurred. Operates on runes so multi-byte
+// UTF-8 sequences (CJK, emoji) are not cut mid-codepoint — the prior
+// byte-based len() check would lop off the trailing byte of a character
+// and render invalid text to MCP clients. Used for elicitation prompts
+// and any other user-facing summary that embeds YNAB-supplied strings.
+func truncateForDisplay(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 // ============================================================================
@@ -765,6 +846,37 @@ func buildUpdateTransactionElicitMessage(before wireTransaction, in UpdateTransa
 // object.
 func formatSignedMoney(milliunits int64) string {
 	return formatMilliunits(milliunits)
+}
+
+// isUpdateNoOp reports whether every field the caller specified in an
+// update request already matches the current YNAB value. When true, the
+// tool short-circuits before prompting, issuing the PUT, or writing an
+// audit entry — an otherwise wasted round-trip that would also pollute
+// the audit log with a zero-delta record. Review finding on
+// doUpdateTransaction no-op short-circuit.
+func isUpdateNoOp(before wireTransaction, in UpdateTransactionInput) bool {
+	if in.CategoryID != nil && deref(before.CategoryID) != *in.CategoryID {
+		return false
+	}
+	if in.PayeeID != nil && deref(before.PayeeID) != *in.PayeeID {
+		return false
+	}
+	if in.PayeeName != nil && deref(before.PayeeName) != *in.PayeeName {
+		return false
+	}
+	if in.Memo != nil && deref(before.Memo) != *in.Memo {
+		return false
+	}
+	if in.Approved != nil && before.Approved != *in.Approved {
+		return false
+	}
+	if in.Cleared != nil && before.Cleared != *in.Cleared {
+		return false
+	}
+	if in.FlagColor != nil && deref(before.FlagColor) != *in.FlagColor {
+		return false
+	}
+	return true
 }
 
 // orDefault returns s if non-empty, otherwise def.

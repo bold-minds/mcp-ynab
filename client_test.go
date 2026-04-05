@@ -585,7 +585,10 @@ func TestDeltaSync_Accounts_FirstCallPopulatesCache(t *testing.T) {
 }
 
 // TestDeltaSync_Transactions_UnfilteredOnly verifies that delta sync
-// applies to unfiltered list_transactions but NOT to filtered variants.
+// applies to list_transactions on the main /transactions endpoint
+// regardless of since_date, but NOT to scope-filtered variants. Review
+// finding H2 also asserts here: an omitted since_date defaults to a
+// 90-day window to protect first-call size on multi-year plans.
 func TestDeltaSync_Transactions_UnfilteredOnly(t *testing.T) {
 	t.Parallel()
 	var seenQueries []string
@@ -595,24 +598,33 @@ func TestDeltaSync_Transactions_UnfilteredOnly(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":{"server_knowledge": 500, "transactions": []}}`))
 	})
 
+	// Call 1: omitted since_date → H2 default (90d window), first call
+	// so no cached knowledge.
 	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	// Call 2: cache is now primed, omitted since_date → handler keeps
+	// since_date empty to let the fetch layer delta-sync from cache.
 	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	// Call 3: explicit since_date still delta-syncs via the relaxed gate.
 	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{
 		PlanID: "plan-1", SinceDate: "2026-01-01",
 	})
+	// Call 4: same as call 2, cache still primed.
 	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
 
 	if len(seenQueries) != 4 {
 		t.Fatalf("expected 4 requests, got %d", len(seenQueries))
 	}
-	if seenQueries[0] != "" {
-		t.Errorf("call 1 should have no query params, got %q", seenQueries[0])
+	if !strings.Contains(seenQueries[0], "since_date=") {
+		t.Errorf("call 1 should apply the H2 90-day default since_date, got %q", seenQueries[0])
+	}
+	if strings.Contains(seenQueries[0], "last_knowledge_of_server") {
+		t.Errorf("call 1 should not send last_knowledge_of_server (cold cache), got %q", seenQueries[0])
 	}
 	if !strings.Contains(seenQueries[1], "last_knowledge_of_server=500") {
 		t.Errorf("call 2 should include last_knowledge_of_server=500, got %q", seenQueries[1])
 	}
-	if strings.Contains(seenQueries[2], "last_knowledge_of_server") {
-		t.Errorf("call 3 (filtered by since_date) should NOT include last_knowledge_of_server, got %q", seenQueries[2])
+	if !strings.Contains(seenQueries[2], "last_knowledge_of_server=500") {
+		t.Errorf("call 3 should delta-sync even with explicit since_date, got %q", seenQueries[2])
 	}
 	if !strings.Contains(seenQueries[2], "since_date=2026-01-01") {
 		t.Errorf("call 3 should include since_date filter, got %q", seenQueries[2])

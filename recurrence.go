@@ -199,14 +199,33 @@ var knownFrequencySet = func() map[string]struct{} {
 	return m
 }()
 
-// dateOnly returns t converted to UTC with its time components zeroed.
-// Normalizing to a single location matters because FrequencyOccurrences
-// compares dateNext / windowStart / windowEnd as absolute instants —
-// mixed-timezone inputs (e.g. a caller that passes one in local time and
-// another in UTC) would miscompare at day boundaries without this
-// normalization. Review finding M3.
+// dateOnly returns a time at midnight on the civil calendar date that t
+// represents in its own location, with the same location preserved.
+//
+// Previously this function converted t to UTC before extracting Y/M/D,
+// which silently flipped the calendar date for any caller in a
+// non-UTC location — e.g. a Pacific-time instant at 23:00 local became
+// 06:00 next-day UTC and the scheduled-transactions window would shift
+// by a day. The conversion was invisible to the test suite because every
+// existing caller passes UTC times, but the bug waited for the first
+// non-UTC caller to surface. Review finding H7.
+//
+// Callers that want cross-timezone normalization should convert to a
+// single Location (e.g. UTC) BEFORE calling dateOnly, making the choice
+// explicit at the call site.
 func dateOnly(t time.Time) time.Time {
-	u := t.UTC()
-	y, m, d := u.Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+// daysBetween returns the number of calendar days between the civil dates
+// of from and to (in each argument's own location). Anchoring both to a
+// calendar day before subtracting avoids the Hours()/24 off-by-one that
+// fires when two timestamps straddle a day boundary by less than 24h but
+// land on different dates. Used for days_since_last_reconciled and any
+// similar "how many days elapsed" display. Review finding M16.
+func daysBetween(from, to time.Time) int {
+	d1 := dateOnly(from)
+	d2 := dateOnly(to)
+	return int(d2.Sub(d1).Hours() / 24)
 }

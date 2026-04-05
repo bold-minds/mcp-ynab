@@ -10,12 +10,18 @@
 
 FROM golang:1.25-alpine@sha256:8e02eb337d9e0ea459e041f1ee5eece41cbb61f1d83e7d883a3e2fb4862063fa AS build
 WORKDIR /src
-RUN apk add --no-cache ca-certificates
+# ca-certificates were installed here in an earlier iteration to let the
+# build stage fetch modules over HTTPS, but the golang:alpine base image
+# already ships them — the extra `apk add` was dead weight. The distroless
+# runtime stage below brings its own trust store. Review finding on dead
+# apk add.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build \
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 go build \
     -trimpath \
     -ldflags "-s -w -X main.Version=${VERSION}" \
     -o /out/mcp-ynab .

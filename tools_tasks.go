@@ -214,8 +214,12 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 		totalBalanceMu += owed
 		totalInterestMu += interest
 
-		// Warning: minimum payment less than monthly interest.
-		if cfg.MinimumPaymentMilliunits < interest {
+		// Warning: minimum payment does not exceed monthly interest.
+		// Uses <= (not <) so accounts at exact break-even are flagged —
+		// a break-even account pays down zero principal, which is what
+		// the warning exists to surface. The aggregate negative-amort
+		// check below uses the same inclusive boundary. Review finding H4.
+		if cfg.MinimumPaymentMilliunits <= interest {
 			warnings = append(warnings, DebtSnapshotWarning{
 				AccountID:                 cfg.AccountID,
 				Nickname:                  nickname,
@@ -249,6 +253,24 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 			formatMilliunits(in.ExtraPerMonthMilliunits),
 			formatMilliunits(totalInterestMu),
 			formatMilliunits(totalInterestMu-totalMinimumsMu-in.ExtraPerMonthMilliunits+1),
+		)
+	}
+
+	// Guard the int64 multiply. At plausible household scales
+	// totalInterestMu is well under 2^59 so 12× is safe, but a caller
+	// passing a stress-test or pathological config (thousand-account plan
+	// with 1000% APRs) could cross math.MaxInt64/12. A silent wraparound
+	// would render a negative "annual interest" that looks like YNAB gave
+	// the user money. Clamp at the boundary with a structured error so
+	// the caller sees an actionable message. Review finding on
+	// AnnualInterestCost overflow.
+	const maxForAnnualMul = int64(1<<63-1) / 12
+	if totalInterestMu > maxForAnnualMul {
+		return nil, YnabDebtSnapshotOutput{}, fmt.Errorf(
+			"total_monthly_interest %d milliunits exceeds the representable "+
+				"range for a 12× annualization (cap=%d); review APRs and balances "+
+				"for stress-test inputs",
+			totalInterestMu, maxForAnnualMul,
 		)
 	}
 
@@ -341,7 +363,22 @@ func simulateAvalanche(
 ) (DebtPayoffProjection, error) {
 	const maxMonths = 600
 
+	// Six parallel slices MUST have identical length. The caller
+	// constructs them all from the same DebtAccountConfig loop, but an
+	// internal refactor could easily introduce a mismatch that silently
+	// indexes out of bounds or skips an account. Assert the invariant
+	// explicitly — cheap, and transforms a future bug into an
+	// actionable error instead of a panic or a wrong projection.
+	// Review finding on simulateAvalanche slice parity.
 	n := len(initialBalances)
+	if len(aprBps) != n || len(minimums) != n || len(aprPercents) != n ||
+		len(ids) != n || len(nicknames) != n {
+		return DebtPayoffProjection{}, fmt.Errorf(
+			"simulateAvalanche: input slice length mismatch: "+
+				"balances=%d aprBps=%d minimums=%d aprPercents=%d ids=%d nicknames=%d",
+			n, len(aprBps), len(minimums), len(aprPercents), len(ids), len(nicknames),
+		)
+	}
 	balances := make([]int64, n)
 	startingBalances := make([]int64, n)
 	copy(balances, initialBalances)
@@ -558,6 +595,13 @@ var debtAccountTypes = map[string]bool{
 type YnabStatusInput struct {
 	PlanID            string              `json:"plan_id" jsonschema:"YNAB plan id, or 'last-used' / 'default'"`
 	DebtAccountConfig []DebtAccountConfig `json:"debt_account_config,omitempty" jsonschema:"optional: debt accounts to enrich with APR and monthly interest. If omitted, debt accounts appear without APR/interest fields."`
+	// AsOfDate anchors the 7-day scheduled-transactions window and the
+	// days_since_last_reconciled calculation. Defaults to today (UTC).
+	// Accepting an explicit value mirrors YnabWeeklyCheckin and removes the
+	// clock race a Sunday-ritual caller would otherwise hit across 00:00
+	// UTC (e.g. 23:55 local vs 00:05 local returning different windows).
+	// Review finding H5.
+	AsOfDate string `json:"as_of_date,omitempty" jsonschema:"anchor for the 7-day scheduled window and reconciliation ages (YYYY-MM-DD); defaults to today (UTC)"`
 }
 
 // DebtStatusEntry is a debt account in the status output. APR and
@@ -631,6 +675,12 @@ type YnabStatusOutput struct {
 	// the internal aggregation safety ceiling. The count in that case is
 	// a lower bound.
 	Truncated bool `json:"truncated,omitempty" jsonschema:"true when unapproved_transaction_count hit the internal 50000-row safety ceiling; the count is a lower bound in that case"`
+	// MalformedScheduledDateCount reports how many scheduled transactions
+	// were skipped because their date_next could not be parsed as YYYY-MM-DD.
+	// Previously these were silently dropped — a bill with a malformed
+	// recurrence row would vanish from the dashboard and the user would
+	// miss it. Callers should surface this when non-zero. Review finding H6.
+	MalformedScheduledDateCount int `json:"malformed_scheduled_date_count,omitempty" jsonschema:"count of scheduled transactions skipped due to unparseable date_next; non-zero means at least one scheduled item was omitted from scheduled_next_7_days"`
 }
 
 // liquidAccountTypes is the set of YNAB account types considered
@@ -649,6 +699,18 @@ var liquidAccountTypes = map[string]bool{
 func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in YnabStatusInput) (*mcp.CallToolResult, YnabStatusOutput, error) {
 	if in.PlanID == "" {
 		return nil, YnabStatusOutput{}, errors.New("plan_id is required")
+	}
+	// Resolve as_of anchor. When omitted, use current UTC. When provided,
+	// require YYYY-MM-DD. All time-dependent math below (7-day scheduled
+	// window, days-since-reconciled) uses this value so callers can pin
+	// the result across a clock boundary. Review finding H5.
+	asOf := nowUTC()
+	if in.AsOfDate != "" {
+		parsed, err := time.Parse("2006-01-02", in.AsOfDate)
+		if err != nil {
+			return nil, YnabStatusOutput{}, errors.New("as_of_date must be YYYY-MM-DD")
+		}
+		asOf = parsed
 	}
 	// Check for caller cancellation up-front. Each sub-call's httpClient.Do
 	// also respects ctx, but an already-cancelled ctx should short-circuit
@@ -807,7 +869,7 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// Off-budget tracking accounts (investments, assets the user is
 	// merely monitoring) are not reconciled in the YNAB sense, so
 	// including them here produces noise. Review finding M7.
-	today := nowUTC()
+	today := asOf
 	for _, a := range accOut.Accounts {
 		if !a.OnBudget {
 			continue
@@ -817,11 +879,15 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 			Name:      a.Name,
 		}
 		if a.LastReconciledAt != nil {
-			days := int(today.Sub(*a.LastReconciledAt).Hours() / 24)
-			if days < 0 {
-				days = 0
+			// Normalize both endpoints to a calendar date before
+			// subtracting so a reconciliation at 23:00 UTC and a call at
+			// 01:00 UTC the next day report "1 day", not "0". Review
+			// finding M16.
+			daysVal := daysBetween(*a.LastReconciledAt, today)
+			if daysVal < 0 {
+				daysVal = 0
 			}
-			entry.Days = &days
+			entry.Days = &daysVal
 		}
 		out.DaysSinceLastReconciled = append(out.DaysSinceLastReconciled, entry)
 	}
@@ -833,10 +899,16 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	windowStart := dateOnly(today)
 	windowEnd := windowStart.AddDate(0, 0, 6)
 	var totalOutflowMu, totalInflowMu int64
+	var malformedCount int
 	for _, s := range schedOut.ScheduledTransactions {
 		parsedDate, err := time.Parse("2006-01-02", s.DateNext)
 		if err != nil {
-			continue // skip malformed date
+			// Surface the drop as a count on the output. A silently
+			// skipped malformed row previously meant a real bill could
+			// vanish from the Sunday dashboard with no signal. Review
+			// finding H6.
+			malformedCount++
+			continue
 		}
 		occurrences := FrequencyOccurrences(parsedDate, s.Frequency, windowStart, windowEnd)
 		for _, occ := range occurrences {
@@ -855,6 +927,7 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	}
 	out.ScheduledNext7Days.TotalOutflow = NewMoney(totalOutflowMu)
 	out.ScheduledNext7Days.TotalInflow = NewMoney(totalInflowMu)
+	out.MalformedScheduledDateCount = malformedCount
 	// Sort occurrences by date ascending for predictable output.
 	sort.Slice(out.ScheduledNext7Days.Occurrences, func(i, j int) bool {
 		return out.ScheduledNext7Days.Occurrences[i].Date < out.ScheduledNext7Days.Occurrences[j].Date

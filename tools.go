@@ -41,6 +41,28 @@ func validateISODate(s string) error {
 	return nil
 }
 
+// validateIDShape is a minimal sanity check for identifier-shaped
+// arguments. It rejects empty strings, control characters, and anything
+// containing '/' or '?' — the three shapes that would let a caller break
+// out of the path segment url.PathEscape builds. url.PathEscape is the
+// real defense; this check gives callers a clearer boundary error
+// ("field: invalid identifier") instead of an upstream 400/404. It
+// deliberately does NOT enforce UUID formatting: YNAB accepts
+// plan-lookup keywords ("default", "last-used") and some ids in the
+// wild are not canonical 8-4-4-4-12. Review finding on UUID shape
+// validation.
+func validateIDShape(s string) error {
+	if s == "" {
+		return errors.New("invalid identifier: empty")
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || r == '/' || r == '?' || r == '#' {
+			return errors.New("invalid identifier: contains disallowed character")
+		}
+	}
+	return nil
+}
+
 // validateYNABMonth returns an error if s is not a valid YNAB month
 // argument (YYYY-MM-01 or the literal "current"). Review finding L6.
 func validateYNABMonth(s string) error {
@@ -79,7 +101,7 @@ type ListAccountsOutput struct {
 
 type ListTransactionsInput struct {
 	PlanID     string `json:"plan_id" jsonschema:"YNAB plan id (UUID), or 'last-used' / 'default'"`
-	SinceDate  string `json:"since_date,omitempty" jsonschema:"only include transactions on or after this ISO date (YYYY-MM-DD). Strongly recommended to avoid enormous responses."`
+	SinceDate  string `json:"since_date,omitempty" jsonschema:"only include transactions on or after this ISO date (YYYY-MM-DD). Defaults to 90 days ago if omitted — a bare unfiltered fetch on a multi-year plan can return tens of thousands of rows and OOM the caller."`
 	Type       string `json:"type,omitempty" jsonschema:"optional server-side filter: exactly one of 'uncategorized' or 'unapproved'. Other values (including YNAB's upstream 'unreconciled'/'uncleared') are rejected at the tool boundary. Omit for all transactions."`
 	Limit      int    `json:"limit,omitempty" jsonschema:"max transactions to return, most recent first. Default 100, max 500."`
 	AccountID  string `json:"account_id,omitempty" jsonschema:"only include transactions for this account. At most one of account_id, category_id, or payee_id may be set."`
@@ -146,8 +168,17 @@ func (c *Client) ListPlans(ctx context.Context, _ *mcp.CallToolRequest, _ ListPl
 	}
 	plans := make([]Plan, 0, len(wire.Data.Plans))
 	for _, p := range wire.Data.Plans {
+		// Filter tombstoned plans so the LLM cannot ask the user to
+		// choose between "Household" and "Household (deleted)". Matches
+		// the tombstone-exclusion pattern used by ListAccounts and
+		// ListCategories. Review finding on ListPlans deleted filter.
+		if p.Deleted {
+			continue
+		}
 		plans = append(plans, toPlan(p))
 	}
+	// Sort by name for deterministic output, matching ListAccounts/ListMonths.
+	sort.Slice(plans, func(i, j int) bool { return plans[i].Name < plans[j].Name })
 	return nil, ListPlansOutput{Plans: plans}, nil
 }
 
@@ -245,10 +276,27 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 	if in.Type != "" && in.Type != "uncategorized" && in.Type != "unapproved" {
 		return nil, ListTransactionsOutput{}, errors.New("type must be 'uncategorized' or 'unapproved'")
 	}
-	if in.SinceDate != "" {
-		if err := validateISODate(in.SinceDate); err != nil {
+	sinceDate := in.SinceDate
+	switch {
+	case sinceDate != "":
+		if err := validateISODate(sinceDate); err != nil {
 			return nil, ListTransactionsOutput{}, errors.New("since_date " + err.Error())
 		}
+	case in.AccountID == "" && in.CategoryID == "" && in.PayeeID == "" && in.Type == "" &&
+		c.transactionsDelta.knowledge(in.PlanID) > 0:
+		// Delta sync is primed for this plan — let the fetch path use
+		// last_knowledge_of_server instead of a date window. Delta sync
+		// only ships changed rows, so there is no OOM risk on a bare
+		// unfiltered call once the cache has been populated.
+	default:
+		// First call (or a filtered endpoint that cannot delta-sync):
+		// bound the response with a 90-day default. Previously an omitted
+		// since_date fetched the entire plan server-side and then trimmed
+		// to `limit` in memory — on a multi-year plan this can pull tens
+		// of thousands of rows and OOM the caller. Callers that want the
+		// full history pass since_date explicitly (e.g. the start of the
+		// plan). Review finding H2.
+		sinceDate = nowUTC().AddDate(0, 0, -90).Format("2006-01-02")
 	}
 
 	// Fetch via the shared internal helper, which also services the
@@ -258,7 +306,7 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 	// responsibility since the LLM-facing limit is user-configurable.
 	rawRows, err := c.fetchTransactions(ctx, txnFetchOpts{
 		planID:     in.PlanID,
-		sinceDate:  in.SinceDate,
+		sinceDate:  sinceDate,
 		txnType:    in.Type,
 		accountID:  in.AccountID,
 		categoryID: in.CategoryID,
@@ -268,8 +316,16 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 		return nil, ListTransactionsOutput{}, sanitizedErr(err)
 	}
 
-	sort.Slice(rawRows, func(i, j int) bool {
-		return rawRows[i].Date > rawRows[j].Date
+	// Stable sort on (date desc, id) so ties within a day keep a
+	// deterministic order across calls. An unstable sort would reshuffle
+	// same-day transactions between calls, producing a phantom "these
+	// rows changed" signal for a client diffing successive responses.
+	// Review finding on unstable sort.
+	sort.SliceStable(rawRows, func(i, j int) bool {
+		if rawRows[i].Date != rawRows[j].Date {
+			return rawRows[i].Date > rawRows[j].Date
+		}
+		return rawRows[i].ID < rawRows[j].ID
 	})
 	truncated := len(rawRows) > limit
 	if truncated {
@@ -352,11 +408,15 @@ func (c *Client) fetchTransactions(ctx context.Context, opts txnFetchOpts) ([]Tr
 		return plainToTransactions(wire.Data.Transactions), nil
 	default:
 		path := planPath + "/transactions"
-		// Delta sync is eligible ONLY when no filters are set (no
-		// scope, no since_date, no type). If any filter is present,
-		// we do a full fetch without cache interaction because YNAB's
-		// delta semantics on filtered endpoints are under-documented.
-		canDeltaSync := opts.sinceDate == "" && opts.txnType == ""
+		// Delta sync is eligible on the main /transactions endpoint
+		// regardless of since_date. Per YNAB's API, last_knowledge_of_server
+		// is the authoritative delta cursor on this endpoint and composes
+		// with since_date — YNAB returns rows matching since_date that
+		// have changed since the cached knowledge. We still gate on
+		// txnType because the "uncategorized"/"unapproved" filters alter
+		// which rows count as "deltas" in ways YNAB's docs do not
+		// enumerate, and the scope-filtered endpoints route above.
+		canDeltaSync := opts.txnType == ""
 		if canDeltaSync {
 			if k := c.transactionsDelta.knowledge(opts.planID); k > 0 {
 				q.Set("last_knowledge_of_server", strconv.FormatInt(k, 10))
@@ -407,6 +467,15 @@ func (c *Client) fetchTransactionsForAggregation(ctx context.Context, opts txnFe
 		return nil, false, err
 	}
 	if len(rows) > aggregationCeiling {
+		// Sort date-descending BEFORE truncating so the ceiling keeps the
+		// most-recent rows, not an arbitrary prefix of the YNAB response.
+		// The contract this function implies — "most recent N when the
+		// ceiling trips" — was silently fake before: the upstream order is
+		// unspecified, so aggregations were computed on an arbitrary
+		// subset. Review finding H3.
+		sort.Slice(rows, func(i, j int) bool {
+			return rows[i].Date > rows[j].Date
+		})
 		return rows[:aggregationCeiling], true, nil
 	}
 	return rows, false, nil
@@ -531,6 +600,15 @@ func (c *Client) ListPayees(ctx context.Context, _ *mcp.CallToolRequest, in List
 	if err := c.doJSON(ctx, path, nil, &wire); err != nil {
 		return nil, ListPayeesOutput{}, sanitizedErr(err)
 	}
+	// Case-fold substring match. strings.ToLower is locale-insensitive
+	// and handles ASCII correctly; for YNAB's payee names (free-form
+	// strings that can contain any Unicode) we fall back on
+	// strings.EqualFold-style semantics by using strings.ToLower on both
+	// sides — same behavior as the Go stdlib `i` regexp flag. This is
+	// still imperfect for Turkish dotless-I and German ß, but matches
+	// the Go standard-library baseline and is what users expect from a
+	// "case-insensitive substring" contract. Review finding on payee
+	// search locale.
 	needle := strings.ToLower(in.NameContains)
 	payees := make([]Payee, 0, len(wire.Data.Payees))
 	for _, p := range wire.Data.Payees {
@@ -542,6 +620,11 @@ func (c *Client) ListPayees(ctx context.Context, _ *mcp.CallToolRequest, in List
 		}
 		payees = append(payees, toPayee(p))
 	}
+	// Deterministic output: sort by name (matches ListAccounts/ListMonths).
+	// Prior revision returned payees in YNAB response order, which is
+	// insertion-order and leaks to the LLM as apparent instability across
+	// calls. Review finding on inconsistent determinism contract.
+	sort.Slice(payees, func(i, j int) bool { return payees[i].Name < payees[j].Name })
 	return nil, ListPayeesOutput{Payees: payees}, nil
 }
 
@@ -578,6 +661,16 @@ func (c *Client) ListCategories(ctx context.Context, _ *mcp.CallToolRequest, in 
 			categories = append(categories, toCategory(cat))
 		}
 	}
+	// Deterministic output: sort by (group name, category name). Matches
+	// the ListAccounts / ListMonths determinism contract so the LLM sees
+	// a stable ordering across calls. Review finding on inconsistent
+	// determinism contract.
+	sort.Slice(categories, func(i, j int) bool {
+		if categories[i].GroupName != categories[j].GroupName {
+			return categories[i].GroupName < categories[j].GroupName
+		}
+		return categories[i].Name < categories[j].Name
+	})
 	return nil, ListCategoriesOutput{Categories: categories}, nil
 }
 

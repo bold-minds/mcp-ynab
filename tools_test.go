@@ -41,7 +41,9 @@ func TestListPlans_Success(t *testing.T) {
 	if len(out.Plans) != 2 {
 		t.Fatalf("expected 2 plans, got %d", len(out.Plans))
 	}
-	if out.Plans[0].Name != "Personal" || out.Plans[1].Name != "Business" {
+	// ListPlans sorts by name (deterministic output contract) — "Business"
+	// precedes "Personal" alphabetically regardless of YNAB response order.
+	if out.Plans[0].Name != "Business" || out.Plans[1].Name != "Personal" {
 		t.Errorf("unexpected plans: %+v", out.Plans)
 	}
 }
@@ -195,16 +197,53 @@ func TestListTransactions_InvalidTypeRejected(t *testing.T) {
 
 func TestListTransactions_LimitCapping(t *testing.T) {
 	t.Parallel()
+	// Build a server response containing 700 rows so the cap logic has
+	// something to bite on. Prior to this revision the test asserted only
+	// err != nil, which meant a broken cap (e.g. returning all 700 rows
+	// unconditionally) would still pass. Assert the actual post-cap
+	// lengths instead.
+	var body []byte
+	body = append(body, []byte(`{"data":{"transactions":[`)...)
+	for i := range 700 {
+		if i > 0 {
+			body = append(body, ',')
+		}
+		body = append(body, []byte(fmt.Sprintf(
+			`{"id":"t%d","date":"2026-03-%02d","amount":-1000,"account_id":"a","approved":true,"cleared":"cleared","deleted":false}`,
+			i, 1+(i%28),
+		))...)
+	}
+	body = append(body, []byte(`]}}`)...)
+
 	client, _ := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"transactions":[]}}`))
+		_, _ = w.Write(body)
 	})
-	for _, limit := range []int{0, -5, 9999} {
-		_, _, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-			PlanID: "p", Limit: limit,
+
+	// Expected lengths after the handler's default/cap/clamp logic:
+	//   limit=0   → default 100
+	//   limit=-5  → default 100
+	//   limit=50  → honored
+	//   limit=9999 → clamped to 500
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{0, 100}, {-5, 100}, {50, 50}, {9999, 500},
+	}
+	for _, c := range cases {
+		_, out, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
+			PlanID: "p", Limit: c.in, SinceDate: "2020-01-01",
 		})
 		if err != nil {
-			t.Errorf("limit %d: %v", limit, err)
+			t.Errorf("limit %d: %v", c.in, err)
+			continue
+		}
+		if len(out.Transactions) != c.want {
+			t.Errorf("limit %d: expected %d rows, got %d", c.in, c.want, len(out.Transactions))
+		}
+		if !out.Truncated {
+			t.Errorf("limit %d: Truncated should be true (700 rows > cap)", c.in)
 		}
 	}
 }

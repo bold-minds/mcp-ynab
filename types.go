@@ -34,6 +34,11 @@ type wirePlan struct {
 	LastModifiedOn *time.Time `json:"last_modified_on,omitempty"`
 	FirstMonth     string     `json:"first_month,omitempty"`
 	LastMonth      string     `json:"last_month,omitempty"`
+	// Deleted tombstones are included in the YNAB /budgets response for
+	// users who have deleted a plan from the app; filtering them out
+	// matches ListAccounts/ListCategories behavior. Review finding on
+	// ListPlans deleted filter.
+	Deleted bool `json:"deleted"`
 }
 
 type wireAccountsResponse struct {

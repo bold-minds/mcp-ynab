@@ -28,6 +28,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -74,6 +75,15 @@ func main() {
 	}
 
 	if err := run(); err != nil {
+		// A clean SIGTERM/SIGINT shutdown cancels the server context and
+		// the SDK's StdioTransport.Run returns context.Canceled. That's
+		// the normal "the operator asked us to stop" exit — not a fatal
+		// error. Exit 0 without a scary "fatal: context canceled" line.
+		// Review finding on main.go:76 SIGTERM exit.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("mcp-ynab shutting down: %v", err)
+			return
+		}
 		log.Printf("fatal: %v", sanitize(err.Error()))
 		os.Exit(1)
 	}

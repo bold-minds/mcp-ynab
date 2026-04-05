@@ -23,6 +23,15 @@ jobs:
           go-version: '1.25.x'
           check-latest: true
 
+      # Install syft so GoReleaser's sboms: stanza can produce CycloneDX
+      # SBOMs per archive. Without this step the first tag push fails
+      # with "syft: not found" because the hosted runner image does not
+      # ship syft. Pinned to the v0.17.8 release of the sbom-action
+      # download helper to match the rest of the workflow's supply-chain
+      # discipline. Review finding H8.
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0  # v0.17.8
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:

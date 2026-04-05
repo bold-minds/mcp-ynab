@@ -359,15 +359,95 @@ func TestUpdateCategoryBudgeted_RequiresFields(t *testing.T) {
 
 func TestUpdateCategoryBudgeted_AmountBound(t *testing.T) {
 	t.Setenv(envAllowWrites, "1")
-	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
-		t.Error("server should not be called; amount bound should reject before any request")
+	// Delta-based cap needs the before snapshot to compute |new - before|.
+	// Serve a before state of 0 so new=$15K produces a $15K delta that
+	// trips the $10K cap. Review finding H1.
+	var patchCalled bool
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patchCalled = true
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"category":{
+			"id":"c","category_group_id":"g","category_group_name":"x","name":"Groceries",
+			"hidden":false,"budgeted":0,"activity":0,"balance":0,"deleted":false
+		}}}`))
 	})
 	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
 		PlanID: "p", Month: "current", CategoryID: "c",
-		NewBudgetedMilliunits: 15_000_000, // $15K, over cap
+		NewBudgetedMilliunits: 15_000_000, // $15K delta from 0, over cap
 	})
 	if err == nil || !strings.Contains(err.Error(), "amount_override_milliunits") {
 		t.Errorf("expected amount bound error, got %v", err)
+	}
+	if patchCalled {
+		t.Error("PATCH must not be issued when the cap trips")
+	}
+}
+
+// TestUpdateCategoryBudgeted_AmountBoundGuardsDelta is the regression test
+// for review finding H1. Prior to the fix, the cap guarded the target
+// value (`new_budgeted_milliunits`) — allowing a caller to move $50K out
+// of a category by writing a small new value, because |new| < $10K even
+// though |delta| = $50K. The guard must now trigger on |new - before|.
+func TestUpdateCategoryBudgeted_AmountBoundGuardsDelta(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	var patchCalled bool
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patchCalled = true
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Before = $51K. Set new to $1K → delta is -$50K, well over cap.
+		_, _ = w.Write([]byte(`{"data":{"category":{
+			"id":"c","category_group_id":"g","category_group_name":"x","name":"Savings",
+			"hidden":false,"budgeted":51000000,"activity":0,"balance":51000000,"deleted":false
+		}}}`))
+	})
+	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
+		PlanID: "p", Month: "current", CategoryID: "c",
+		NewBudgetedMilliunits: 1_000_000, // $1K new, but delta is -$50K
+	})
+	if err == nil || !strings.Contains(err.Error(), "amount_override_milliunits") {
+		t.Errorf("expected amount bound error for large delta, got %v", err)
+	}
+	if patchCalled {
+		t.Error("PATCH must not be issued when the cap trips on delta")
+	}
+}
+
+// TestUpdateCategoryBudgeted_SmallDeltaPassesCap verifies the inverse:
+// a large target value is fine as long as the delta is small.
+func TestUpdateCategoryBudgeted_SmallDeltaPassesCap(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	var patchCalled bool
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPatch {
+			patchCalled = true
+			_, _ = w.Write([]byte(`{"data":{"category":{
+				"id":"c","category_group_id":"g","category_group_name":"x","name":"Vacation",
+				"hidden":false,"budgeted":50001000,"activity":0,"balance":50001000,"deleted":false
+			}}}`))
+			return
+		}
+		// Before = $50K (over cap). New = $50.001K → delta = $1, under cap.
+		_, _ = w.Write([]byte(`{"data":{"category":{
+			"id":"c","category_group_id":"g","category_group_name":"x","name":"Vacation",
+			"hidden":false,"budgeted":50000000,"activity":0,"balance":50000000,"deleted":false
+		}}}`))
+	})
+	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
+		PlanID: "p", Month: "current", CategoryID: "c",
+		NewBudgetedMilliunits: 50_001_000,
+	})
+	if err != nil {
+		t.Fatalf("small delta should pass the cap, got %v", err)
+	}
+	if !patchCalled {
+		t.Error("PATCH should have been issued for a small delta")
 	}
 }
 

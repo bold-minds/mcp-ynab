@@ -8,7 +8,8 @@ Only the **latest released minor version** receives security patches. Older vers
 
 | Version     | Supported |
 | ----------- | --------- |
-| `0.1.x`     | ✅        |
+| `0.2.x`     | ✅        |
+| `0.1.x`     | ❌        |
 | older       | ❌        |
 
 ## Reporting a vulnerability

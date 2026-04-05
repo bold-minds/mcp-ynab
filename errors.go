@@ -86,13 +86,28 @@ func apiError(resp *http.Response) error {
 	}
 	msg := sanitize(fmt.Sprintf("ynab: http %d%s", resp.StatusCode, nameSuffix))
 	// Wrap the 404 sentinel so composition tools can branch on it via
-	// errors.Is without string matching. All other statuses return a
-	// plain error.
+	// errors.Is without string matching. The sentinel itself is a bare
+	// "ynab: http 404"; wrapping the already-formatted msg as "%s: %w"
+	// produced noisy "ynab: http 404: not_found: ynab: http 404"
+	// repetition. Build a distinct sentinel-wrapper here (fmt.Errorf
+	// with `%w` only) so the error chain still supports errors.Is but
+	// the formatted message reads cleanly. Review finding on errYNABNotFound
+	// wrap dedup.
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("%s: %w", msg, errYNABNotFound)
+		return &notFoundError{msg: msg}
 	}
 	return errors.New(msg)
 }
+
+// notFoundError wraps a formatted http-404 message while still matching
+// the errYNABNotFound sentinel via errors.Is. Its Error() returns the
+// original formatted message with no duplicate "ynab: http 404" suffix.
+type notFoundError struct {
+	msg string
+}
+
+func (e *notFoundError) Error() string { return e.msg }
+func (e *notFoundError) Unwrap() error { return errYNABNotFound }
 
 // errHostLocked is returned by the host-locked RoundTripper when a request is
 // attempted against a host other than api.ynab.com. Sentinel so tests can

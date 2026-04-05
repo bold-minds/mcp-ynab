@@ -37,8 +37,12 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Test (race + coverage)
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Test (race + shuffle + coverage)
+        # -shuffle=on randomizes test order so order-sensitive tests
+        # (e.g. env-mutation tests that forget t.Setenv) fail visibly in
+        # CI instead of passing only when they happen to run first.
+        # Review finding on -shuffle=on.
+        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Coverage threshold gate
         # Review finding M13. Fail the build if total package coverage
@@ -90,6 +94,31 @@ jobs:
           go-version: '1.25.x'
           check-latest: true
       - name: Install govulncheck
-        # Pinned — see staticcheck comment above.
+        # TODO: pin by commit SHA to match staticcheck and the rest of
+        # the workflow's supply-chain discipline. The v1.1.4 tag is a
+        # signed semver release from a trusted upstream (golang.org/x),
+        # so the current risk is low, but a SHA pin matches the rest of
+        # the workflow's defense-in-depth. Look up the SHA for the
+        # v1.1.4 tag at https://github.com/golang/vuln/releases/tag/v1.1.4
+        # before the next workflow touch-up. Review finding on
+        # govulncheck SHA pin.
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
       - run: govulncheck ./...
+
+  gosec:
+    name: gosec
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+      - name: Install gosec
+        # TODO: pin by SHA once we confirm the exact upstream commit for
+        # v2.21.4; leaving the pinned tag in place for now matches the
+        # govulncheck step above. Review finding on missing gosec step.
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+      - run: gosec -quiet ./...
