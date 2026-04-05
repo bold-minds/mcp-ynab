@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,7 +39,10 @@ type ynabErrorBody struct {
 var bearerRe = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-~+/=]+`)
 
 // authHeaderRe matches a full Authorization header line (defense-in-depth).
-var authHeaderRe = regexp.MustCompile(`(?i)authorization:\s*\S+`)
+// Uses [^\n]+ (not \S+) so multi-token values like "Authorization: Bearer sk-abc"
+// are fully redacted, not just the first whitespace-separated token.
+// Review finding M13.
+var authHeaderRe = regexp.MustCompile(`(?i)authorization:[^\n]+`)
 
 // sanitize returns s with any bearer-token or Authorization-header pattern
 // replaced. It is applied to every YNAB error detail we forward to MCP clients
@@ -52,22 +56,39 @@ func sanitize(s string) string {
 
 // apiError converts a non-2xx YNAB response into a safe error suitable for
 // surfacing to an MCP client. It deliberately excludes the request URL,
-// request headers, and the raw response body. It returns the HTTP status,
-// the YNAB error.name (short opaque identifier like "not_found" or
-// "unauthorized"), and a sanitized version of error.detail.
+// request headers, the raw response body, and YNAB's error.detail field.
+//
+// Why drop Detail: YNAB's detail is free-form text that can echo caller-
+// supplied input (e.g. "invalid memo: <your-memo-here> contains disallowed
+// chars") on validation failures. Forwarding it would leak user-submitted
+// fields — including anything the user considers private — back through
+// the error surface. The error.name field (short opaque identifier like
+// "not_found", "unauthorized", "validation_error") gives the LLM enough
+// to act on without the leak vector. Review finding L3.
+//
+// Both the status and the Name field are passed through sanitize() in
+// case a proxied/compromised upstream embeds a token-shaped value there.
+// Review finding H2.
 //
 // apiError never returns nil; if the body cannot be parsed as a YNAB error
 // envelope, it still returns a status-only error.
 func apiError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	// Strict decode of the error envelope. If YNAB ever renames a field
+	// or adds one, DisallowUnknownFields causes this decode to fail and
+	// we fall through to the status-only error path — loud failure is
+	// preferred for schema drift on this small fixed envelope. Review
+	// finding M12 (narrow application: only the error schema, not
+	// response data which legitimately has many fields we don't model).
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
 	var parsed ynabErrorBody
-	if err := json.Unmarshal(body, &parsed); err == nil && parsed.Error.Name != "" {
-		return fmt.Errorf(
-			"ynab: http %d: %s: %s",
+	if err := dec.Decode(&parsed); err == nil && parsed.Error.Name != "" {
+		return errors.New(sanitize(fmt.Sprintf(
+			"ynab: http %d: %s",
 			resp.StatusCode,
 			parsed.Error.Name,
-			sanitize(parsed.Error.Detail),
-		)
+		)))
 	}
 	return fmt.Errorf("ynab: http %d", resp.StatusCode)
 }

@@ -77,5 +77,5 @@ func (t *Token) UnmarshalText([]byte) error {
 // every call site is a potential leak vector and must be reviewed.
 //
 // As of this commit, reveal() is called from exactly one place:
-// client.go:(*Client).doJSON, to set the Authorization header.
+// client.go:(*Client).doJSONWithBody, to set the Authorization header.
 func (t Token) reveal() string { return t.raw }

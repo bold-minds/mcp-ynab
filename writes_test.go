@@ -239,22 +239,16 @@ func TestDoJSONWithBody_ErrorDoesNotLeakSubmittedBody(t *testing.T) {
 		t.Fatal("expected error for 400 response")
 	}
 	msg := err.Error()
-	// Note: apiError currently passes parsed.Error.Detail through sanitize().
-	// sanitize() only strips Bearer/Authorization patterns, not arbitrary
-	// user-submitted content. This test documents the current guarantee:
-	// the tool-handler layer is expected to further scrub before surfacing
-	// errors to the MCP client. See the wrapper in tools_writes.go (step 2).
-	//
-	// For now we verify the error includes enough to be useful (http 400,
-	// validation_error) without requiring the detail to have been stripped
-	// — that scrubbing happens at the tool-handler layer.
+	// The error must include the HTTP status and YNAB's error.name (an
+	// opaque identifier the LLM can act on) so callers get actionable
+	// feedback.
 	if !strings.Contains(msg, "http 400") || !strings.Contains(msg, "validation_error") {
 		t.Errorf("error should include status and name, got %q", msg)
 	}
-	// Record whether the memo leaked at THIS layer so a future change that
-	// adds layer-local scrubbing is visible as an expectation flip.
+	// Critical invariant (review finding L3): the submitted memo MUST NOT
+	// appear in the error surface. apiError drops YNAB's error.detail
+	// field entirely because it can echo caller-supplied input.
 	if strings.Contains(msg, secretMemo) {
-		t.Logf("note: submitted memo appears in doJSONWithBody error output; " +
-			"tool-handler wrappers are responsible for scrubbing before returning to MCP clients")
+		t.Errorf("REDACTION FAILURE: submitted memo leaked into error output: %q", msg)
 	}
 }

@@ -607,13 +607,14 @@ func TestListScheduledTransactions_Success(t *testing.T) {
 }
 
 func TestListScheduledTransactions_UpcomingDaysFilter(t *testing.T) {
-	t.Parallel()
-	// We cannot hard-code dates because the cutoff is computed from
-	// time.Now(). Instead, use a very large upcoming_days to include all,
-	// and a very small one (1) to exclude anything scheduled far in the
-	// future.
-	today := time.Now().UTC().Format("2006-01-02")
-	farFuture := time.Now().UTC().AddDate(1, 0, 0).Format("2006-01-02") // +1 year
+	// Clock override is atomic-safe; don't t.Parallel() the leaf so the
+	// asserted cutoff value stays deterministic for this test's body.
+	// Review findings M8 and L4.
+	frozen := time.Date(2026, 4, 14, 12, 0, 0, 0, time.UTC)
+	setNowUTC(func() time.Time { return frozen })
+	t.Cleanup(resetNowUTC)
+	today := frozen.Format("2006-01-02")
+	farFuture := frozen.AddDate(1, 0, 0).Format("2006-01-02") // +1 year
 	body := fmt.Sprintf(`{"data":{"scheduled_transactions":[
 		{"id":"soon","date_first":"%s","date_next":"%s","frequency":"monthly","amount":-1000,"account_id":"a","account_name":"Checking","deleted":false},
 		{"id":"later","date_first":"%s","date_next":"%s","frequency":"yearly","amount":-1000,"account_id":"a","account_name":"Checking","deleted":false}

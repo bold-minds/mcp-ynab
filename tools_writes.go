@@ -176,7 +176,7 @@ type wireNewTransaction struct {
 	PayeeName  *string `json:"payee_name,omitempty"`
 	CategoryID *string `json:"category_id,omitempty"`
 	Memo       *string `json:"memo,omitempty"`
-	Cleared    string  `json:"cleared,omitempty"`
+	Cleared    *string `json:"cleared,omitempty"`
 	Approved   bool    `json:"approved"`
 	ImportID   *string `json:"import_id,omitempty"`
 }
@@ -277,6 +277,22 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if in.ImportID != "" && len(in.ImportID) > 36 {
 		return nil, CreateTransactionOutput{}, errors.New("import_id must be at most 36 characters")
 	}
+	// Validate cleared enum if caller supplied it. YNAB's API accepts only
+	// these three values; pre-validating here gives a clear error instead
+	// of a generic upstream 400. Matches the equivalent check in
+	// UpdateTransaction. Review finding H3.
+	if in.Cleared != "" {
+		switch in.Cleared {
+		case "cleared", "uncleared", "reconciled":
+		default:
+			return nil, CreateTransactionOutput{}, errors.New("cleared must be one of: cleared, uncleared, reconciled")
+		}
+	}
+	// Mutually-exclusive payee fields: allowing both creates undocumented
+	// precedence semantics at YNAB. Review finding M5.
+	if in.PayeeID != "" && in.PayeeName != "" {
+		return nil, CreateTransactionOutput{}, errors.New("at most one of payee_id or payee_name may be set")
+	}
 	if err := checkAmountBound(in.AmountMilliunits, in.AmountOverrideMilliunits); err != nil {
 		return nil, CreateTransactionOutput{}, sanitizedErr(err)
 	}
@@ -314,8 +330,11 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 			AccountID: in.AccountID,
 			Date:      date,
 			Amount:    in.AmountMilliunits,
-			Cleared:   cleared,
-			Approved:  approved,
+			// Cleared is a *string so the defaulted value is always
+			// present in the POST body even if future code removes the
+			// "uncleared" default above. Review finding H4.
+			Cleared:  &cleared,
+			Approved: approved,
 		},
 	}
 	if in.PayeeID != "" {
@@ -374,6 +393,9 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	month := in.Month
 	if month == "" {
 		return nil, UpdateCategoryBudgetedOutput{}, errors.New("month is required (YYYY-MM-01 or 'current')")
+	}
+	if err := validateYNABMonth(month); err != nil {
+		return nil, UpdateCategoryBudgetedOutput{}, errors.New("month " + err.Error())
 	}
 	if err := checkAmountBound(in.NewBudgetedMilliunits, in.AmountOverrideMilliunits); err != nil {
 		return nil, UpdateCategoryBudgetedOutput{}, sanitizedErr(err)
@@ -630,10 +652,12 @@ func buildUpdateTransactionElicitMessage(before wireTransaction, in UpdateTransa
 	if in.CategoryID != nil {
 		changes = append(changes, fmt.Sprintf("category: %s → (new id=%s)", deref(before.CategoryName), *in.CategoryID))
 	}
+	// PayeeID takes precedence when both are set (YNAB resolves name via
+	// the id); render only one line in that case to avoid a confusing
+	// double-change summary during elicitation.
 	if in.PayeeID != nil {
 		changes = append(changes, fmt.Sprintf("payee: %s → (new id=%s)", deref(before.PayeeName), *in.PayeeID))
-	}
-	if in.PayeeName != nil {
+	} else if in.PayeeName != nil {
 		changes = append(changes, fmt.Sprintf("payee_name: %q → %q", deref(before.PayeeName), *in.PayeeName))
 	}
 	if in.Memo != nil {

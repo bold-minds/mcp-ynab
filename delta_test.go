@@ -184,12 +184,21 @@ func TestDeltaCache_ConcurrentMergeAndRead(t *testing.T) {
 			defer wg.Done()
 			items := make([]testEntity, 20)
 			for i := 0; i < 20; i++ {
+				// Explicit base-10 formatting: the prior "rune('0'+i)"
+				// scheme produced non-alphanumeric runes for i>=10
+				// (:, ;, <, ...), which worked but was confusing in
+				// failure output. Review finding L12.
 				items[i] = testEntity{
-					ID:   string(rune('a' + worker)) + string(rune('0'+i)),
+					ID:   "w" + itoa(int64(worker)) + "-" + itoa(int64(i)),
 					Name: "item",
 				}
 			}
-			c.merge(planID, int64(worker*100), items, testID, testDeleted)
+			// All workers use the same server_knowledge value so the
+			// monotonicity guard (M2) does not skip a worker whose
+			// goroutine happens to run after a higher-knowledge worker.
+			// Real YNAB usage is sequential, not concurrent, so the
+			// out-of-order case is a synthetic-test artifact.
+			c.merge(planID, 1000, items, testID, testDeleted)
 		}(w)
 	}
 	// 5 readers calling knowledge/size in a loop.

@@ -33,7 +33,10 @@
 
 package main
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 // FrequencyOccurrences returns every occurrence date of a scheduled
 // transaction within the inclusive window [windowStart, windowEnd],
@@ -77,11 +80,14 @@ func FrequencyOccurrences(dateNext time.Time, frequency string, windowStart, win
 	// Safety cap on iteration: 2000 steps covers >5 years of daily
 	// occurrences, which is more than any realistic window for a YNAB
 	// scheduled transaction (YNAB's own docs cap scheduled transactions
-	// at 5 years into the future).
+	// at 5 years into the future). If a caller ever hits the cap, we
+	// log a diagnostic so silent truncation is observable in operator
+	// logs rather than silently returning a partial slice.
 	const maxIter = 2000
 	out := make([]time.Time, 0, 16)
 	cur := dateNext
-	for i := 0; i < maxIter; i++ {
+	i := 0
+	for ; i < maxIter; i++ {
 		if cur.After(windowEnd) {
 			break
 		}
@@ -96,6 +102,13 @@ func FrequencyOccurrences(dateNext time.Time, frequency string, windowStart, win
 			break
 		}
 		cur = next
+	}
+	if i == maxIter {
+		log.Printf("recurrence: FrequencyOccurrences hit maxIter=%d for frequency=%q (dateNext=%s window=[%s,%s]); result may be truncated",
+			maxIter, frequency,
+			dateNext.Format("2006-01-02"),
+			windowStart.Format("2006-01-02"),
+			windowEnd.Format("2006-01-02"))
 	}
 	return out
 }
@@ -173,10 +186,14 @@ var knownFrequencies = []string{
 	"everyOtherYear",
 }
 
-// dateOnly returns t with its time components zeroed. Used to normalize
-// inputs so occurrence comparisons are day-granular, matching YNAB's own
-// day-granular date model.
+// dateOnly returns t converted to UTC with its time components zeroed.
+// Normalizing to a single location matters because FrequencyOccurrences
+// compares dateNext / windowStart / windowEnd as absolute instants —
+// mixed-timezone inputs (e.g. a caller that passes one in local time and
+// another in UTC) would miscompare at day boundaries without this
+// normalization. Review finding M3.
 func dateOnly(t time.Time) time.Time {
-	y, m, d := t.Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+	u := t.UTC()
+	y, m, d := u.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }

@@ -266,6 +266,7 @@ type Transaction struct {
 	AccountName       string `json:"account_name"`
 	PayeeID           string `json:"payee_id,omitempty"`
 	PayeeName         string `json:"payee_name,omitempty"`
+	CategoryID        string `json:"category_id,omitempty" jsonschema:"populated so update_transaction callers have a stable id handle without a round-trip to list_categories"`
 	CategoryName      string `json:"category_name,omitempty"`
 	TransferAccountID string `json:"transfer_account_id,omitempty" jsonschema:"populated on one side of an account-transfer transaction: the account_id this transaction transfers TO. Task-shaped tools use this to avoid double-counting transfers."`
 	// IsSubtransaction has two JSON states via omitempty: true (present),
@@ -340,8 +341,7 @@ type Month struct {
 // a future divergence (e.g. formatting a derived field) does not silently
 // break callers. Do not replace with Plan(w).
 func toPlan(w wirePlan) Plan {
-	//lint:ignore S1016 explicit conversion is a deliberate wire/output decoupling
-	return Plan{
+	return Plan{ //nolint:staticcheck // S1016: explicit conversion is a deliberate wire/output decoupling
 		ID:             w.ID,
 		Name:           w.Name,
 		LastModifiedOn: w.LastModifiedOn,
@@ -405,6 +405,7 @@ func toTransaction(w wireTransaction) Transaction {
 		AccountName:       w.AccountName,
 		PayeeID:           deref(w.PayeeID),
 		PayeeName:         deref(w.PayeeName),
+		CategoryID:        deref(w.CategoryID),
 		CategoryName:      deref(w.CategoryName),
 		TransferAccountID: deref(w.TransferAccountID),
 	}

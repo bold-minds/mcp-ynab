@@ -13,27 +13,52 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
+// cachedBinary is a package-level build cache. Subprocess tests share the
+// compiled binary across the run so we incur one `go build` per `go test`
+// invocation instead of 3–4. Review finding L11.
+var (
+	cachedBinary     string
+	cachedBinaryErr  error
+	cachedBinaryOnce sync.Once
+)
+
 // buildTestBinary compiles mcp-ynab to a temp path and returns the path.
-// It caches across tests in the same package run by using t.TempDir at the
-// package level is not straightforward; cheap `go build` is fine (~1s).
+// The compile result is cached across subtests via cachedBinaryOnce so the
+// whole package pays the ~1s build cost exactly once.
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "mcp-ynab-test")
-	cmd := exec.Command("go", "build", "-o", bin, ".")
-	cmd.Env = append(cmd.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build failed: %v\n%s", err, out)
+	cachedBinaryOnce.Do(func() {
+		// Use a well-known path under the OS temp dir; not t.TempDir()
+		// because that would clean up before other tests run.
+		dir, err := os.MkdirTemp("", "mcp-ynab-test-binary-")
+		if err != nil {
+			cachedBinaryErr = err
+			return
+		}
+		bin := filepath.Join(dir, "mcp-ynab-test")
+		cmd := exec.Command("go", "build", "-o", bin, ".")
+		cmd.Env = append(cmd.Environ(), "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			cachedBinaryErr = fmt.Errorf("build failed: %v\n%s", err, out)
+			return
+		}
+		cachedBinary = bin
+	})
+	if cachedBinaryErr != nil {
+		t.Fatal(cachedBinaryErr)
 	}
-	return bin
+	return cachedBinary
 }
 
 // mcpSession wraps a running mcp-ynab subprocess with line-delimited
@@ -98,6 +123,10 @@ func (s *mcpSession) send(t *testing.T, msg any) {
 
 // recvMatching reads lines until it finds one whose "id" matches wantID,
 // or until it hits EOF / the deadline. Notifications (no id) are skipped.
+//
+// On timeout, the reader goroutine is cancelled by closing the subprocess
+// stdin (which causes the server to exit, unblocking the blocked
+// ReadBytes). Review finding L10.
 func (s *mcpSession) recvMatching(t *testing.T, wantID int, deadline time.Duration) map[string]any {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
@@ -129,6 +158,11 @@ func (s *mcpSession) recvMatching(t *testing.T, wantID int, deadline time.Durati
 	}()
 	select {
 	case <-ctx.Done():
+		// Close stdin so the subprocess exits, which unblocks the
+		// reader goroutine via EOF. Without this, the goroutine would
+		// stay parked on ReadBytes until some other code path closes
+		// the pipe.
+		_ = s.stdin.Close()
 		t.Fatalf("timeout waiting for id=%d", wantID)
 		return nil
 	case r := <-ch:

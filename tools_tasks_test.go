@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -54,29 +55,9 @@ func ynabDebtAccountsHandler(accounts ...struct {
 	}
 }
 
-// itoa is a tiny int64 → string helper so the handler builder above
-// doesn't need fmt or strconv imports (keeps the helper self-contained).
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
+// itoa is a thin alias over strconv.FormatInt, retained as a name because
+// many existing call sites in this file and delta_test.go use it.
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 // ---- input validation ------------------------------------------------------
 
@@ -289,42 +270,37 @@ func TestDebtSnapshot_AggregateNegativeAmortizationError(t *testing.T) {
 
 func TestDebtSnapshot_PerAccountWarningButSimulationConverges(t *testing.T) {
 	t.Parallel()
-	// Two accounts:
-	// - Card A: $500 at 30% APR, $5/mo min (interest $12.50, shortfall)
-	// - Card B: $5000 at 5% APR, $500/mo min (interest $20.83, minimum covers)
-	// Aggregate: minimums $505, interest $33 → aggregate covers, simulation
-	// converges. But Card A has per-account shortfall → warning emitted.
+	// Deterministic convergence test. Two accounts:
+	//   - Card A: $50 owed at 30% APR, $1/mo min (interest $1.25, shortfall $0.25 → warning)
+	//   - Card B: $100 owed at 5% APR, $200/mo min
+	// B is overpaid in month 1: leftover ($100) rolls into remainingExtra
+	// and pays down A entirely in the same month, so the minimums-only
+	// projection (which YnabDebtSnapshot always runs first) converges
+	// deterministically. Previous test tolerated non-convergence — the
+	// tolerant branch was dead code. Review nit.
 	client, _ := testClient(t, ynabDebtAccountsHandler(
 		struct {
 			ID     string
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a", Name: "Small Growing Card", OwedMu: 500_000},
+		}{ID: "a", Name: "Small Growing Card", OwedMu: 50_000},
 		struct {
 			ID     string
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "b", Name: "Big Paying Card", OwedMu: 5_000_000},
+		}{ID: "b", Name: "Big Paying Card", OwedMu: 100_000},
 	))
-	// Extra is required to ensure convergence — without extra, avalanche
-	// alone from Big Paying Card cannot reach Small Growing quickly
-	// enough given the 30% APR. Use extra $100/mo.
 	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
 		PlanID: "p",
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a", APRPercent: 30, MinimumPaymentMilliunits: 5_000},
-			{AccountID: "b", APRPercent: 5, MinimumPaymentMilliunits: 500_000},
+			{AccountID: "a", APRPercent: 30, MinimumPaymentMilliunits: 1_000},
+			{AccountID: "b", APRPercent: 5, MinimumPaymentMilliunits: 200_000},
 		},
-		ExtraPerMonthMilliunits: 100_000,
 	})
 	if err != nil {
-		// May or may not converge depending on APR compounding dynamics;
-		// the test tolerates either outcome as long as the warning is
-		// emitted when convergence succeeds.
-		t.Logf("simulation error (acceptable for this edge case): %v", err)
-		return
+		t.Fatalf("simulation should converge deterministically: %v", err)
 	}
 	if len(out.Warnings) == 0 {
 		t.Error("expected warning for Card A (minimum < interest)")
@@ -339,6 +315,44 @@ func TestDebtSnapshot_PerAccountWarningButSimulationConverges(t *testing.T) {
 		t.Error("expected warning for account 'a'")
 	} else if cardAWarning.ShortfallMilliunits <= 0 {
 		t.Errorf("shortfall should be positive, got %d", cardAWarning.ShortfallMilliunits)
+	}
+}
+
+// TestDebtSnapshot_AllZeroBalancesYieldsZeroMonths is the L8 regression.
+// If every debt account starts at zero, the simulation exits on the first
+// allPaidOff() check with month=0 and produces DebtFreeDate == today.
+func TestDebtSnapshot_AllZeroBalancesYieldsZeroMonths(t *testing.T) {
+	// Clock override is atomic-safe (see clock.go) but we still avoid
+	// t.Parallel() so the asserted frozen value is stable across the
+	// test body.
+	frozen := time.Date(2030, 1, 15, 0, 0, 0, 0, time.UTC)
+	setNowUTC(func() time.Time { return frozen })
+	t.Cleanup(resetNowUTC)
+	client, _ := testClient(t, ynabDebtAccountsHandler(
+		struct {
+			ID     string
+			Name   string
+			OwedMu int64
+			Type   string
+		}{ID: "a", Name: "Paid-off Card", OwedMu: 0},
+	))
+	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
+		PlanID: "p",
+		DebtAccountConfig: []DebtAccountConfig{
+			{AccountID: "a", APRPercent: 20, MinimumPaymentMilliunits: 10_000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ProjectionMinimumsOnly == nil {
+		t.Fatal("projection missing")
+	}
+	if out.ProjectionMinimumsOnly.MonthsToDebtFree != 0 {
+		t.Errorf("expected 0 months for zero-balance accounts, got %d", out.ProjectionMinimumsOnly.MonthsToDebtFree)
+	}
+	if out.ProjectionMinimumsOnly.DebtFreeDate != "2030-01" {
+		t.Errorf("expected DebtFreeDate=2030-01 from frozen nowUTC, got %q", out.ProjectionMinimumsOnly.DebtFreeDate)
 	}
 }
 
@@ -1022,13 +1036,9 @@ func weeklyCheckinHandler(priorMonthOverspent bool) http.HandlerFunc {
 				{"id":"t3","date":"2026-04-05","amount":-80000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"C","deleted":false}
 			]}}`))
 		case strings.Contains(p, "/months/2026-04-01"):
-			// Current month detail: Groceries overspent by $30.
-			overspent := ``
-			if !priorMonthOverspent {
-				// newly overspent this month
-				overspent = ``
-			}
-			_ = overspent
+			// Current month detail: Groceries overspent by $30 in both
+			// modes; priorMonthOverspent only varies the prior-month
+			// branch below. Review finding L9.
 			_, _ = w.Write([]byte(`{"data":{"month":{
 				"month":"2026-04-01","income":5000000,"budgeted":2500000,"activity":-2800000,"to_be_budgeted":0,"age_of_money":40,
 				"categories":[
@@ -1295,27 +1305,54 @@ func TestWeeklyCheckin_AgeOfMoneyDeltaDistinguishesZeroFromNull(t *testing.T) {
 	}
 }
 
+// TestWeeklyCheckin_CategoryResolvedFromOverspent exercises the resolved
+// branch: a category that was overspent in the prior month and is no longer
+// overspent in the current month should appear in
+// CategoriesResolvedFromOverspent. Review finding L10.
 func TestWeeklyCheckin_CategoryResolvedFromOverspent(t *testing.T) {
 	t.Parallel()
-	// Prior month: Groceries was overspent. Current month: still -30000
-	// so it's still overspent (not resolved). Use a category that's
-	// now positive would need a different handler. Let me use the
-	// simpler case: just verify that when priorMonthOverspent=true,
-	// Groceries appears in "resolved" only if current month balance is
-	// >= 0. In our current handler, current month Groceries is -30000
-	// so it would NOT be resolved.
-	//
-	// Actually, skip this test — the interesting case is that when a
-	// category was overspent last month and is no longer overspent this
-	// month, it appears in categories_resolved_from_overspent. The
-	// test fixture would need current month Groceries with balance >= 0.
-	// We can reuse the handler by passing priorMonthOverspent=true.
-	// Current month Groceries balance is still -30000 in the fixture.
-	//
-	// For a cleaner "resolved" test, we'd need a different fixture. Mark
-	// this as a follow-up; the newly-overspent path is the primary
-	// v0.2 concern.
-	t.Skip("newly-overspent path covered by TestWeeklyCheckin_PeriodBoundariesAndDeltas")
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/transactions") && r.URL.Query().Get("type") == "unapproved":
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/transactions"):
+			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"transactions":[]}}`))
+		case strings.Contains(r.URL.Path, "/months/2026-04-01"):
+			// Current month: Groceries now positive — resolved.
+			_, _ = w.Write([]byte(`{"data":{"month":{
+				"month":"2026-04-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,
+				"categories":[
+					{"id":"cat-groc","category_group_id":"g","category_group_name":"Immediate","name":"Groceries","budgeted":400000,"activity":-300000,"balance":100000,"deleted":false}
+				]
+			}}}`))
+		case strings.Contains(r.URL.Path, "/months/2026-03-01"):
+			// Prior month: Groceries overspent.
+			_, _ = w.Write([]byte(`{"data":{"month":{
+				"month":"2026-03-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,
+				"categories":[
+					{"id":"cat-groc","category_group_id":"g","category_group_name":"Immediate","name":"Groceries","budgeted":400000,"activity":-500000,"balance":-100000,"deleted":false}
+				]
+			}}}`))
+		default:
+			http.Error(w, "unexpected URL: "+r.URL.Path, http.StatusNotFound)
+		}
+	})
+	_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
+		PlanID: "p", AsOfDate: "2026-04-14",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.CategoriesResolvedFromOverspent) != 1 {
+		t.Fatalf("expected 1 resolved category, got %d: %+v", len(out.CategoriesResolvedFromOverspent), out.CategoriesResolvedFromOverspent)
+	}
+	if out.CategoriesResolvedFromOverspent[0].CategoryID != "cat-groc" {
+		t.Errorf("wrong resolved category: %+v", out.CategoriesResolvedFromOverspent[0])
+	}
+	if len(out.CategoriesNewlyOverspentThisMonth) != 0 {
+		t.Errorf("should not be newly overspent: %+v", out.CategoriesNewlyOverspentThisMonth)
+	}
 }
 
 func TestWeeklyCheckin_RequiresPlanID(t *testing.T) {
@@ -1431,11 +1468,12 @@ func TestWeeklyCheckin_ContextCancelledShortCircuits(t *testing.T) {
 // package-level nowUTC function can be swapped in tests so date-default
 // handlers produce deterministic output.
 func TestCreateTransaction_NowUTCOverridable(t *testing.T) {
-	// Cannot t.Parallel() because nowUTC is a package-level global.
+	// Clock override is atomic-safe; t.Setenv still requires no
+	// t.Parallel() at the leaf test or ancestors.
 	t.Setenv(envAllowWrites, "1")
 	frozen := time.Date(2030, 6, 15, 12, 0, 0, 0, time.UTC)
-	nowUTC = func() time.Time { return frozen }
-	t.Cleanup(func() { nowUTC = defaultNowUTC })
+	setNowUTC(func() time.Time { return frozen })
+	t.Cleanup(resetNowUTC)
 
 	var seenBody map[string]any
 	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {

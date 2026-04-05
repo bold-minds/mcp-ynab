@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
-// Tool handlers for the 5 read-only YNAB endpoints this server exposes.
+// Tool handlers for the read-only YNAB endpoints this server exposes —
+// 8 primitives plus 5 task-shaped composition tools, with 4 write tools
+// registered conditionally when YNAB_ALLOW_WRITES=1.
 // Each handler is an exported method on *Client so it can be tested directly
 // without spinning up the full MCP server. registerTools wires them into an
 // mcp.Server via the generic mcp.AddTool, which automatically derives input
@@ -24,9 +26,33 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// validateISODate returns an error if s is not a valid YYYY-MM-DD date.
+// Used to reject bad inputs at the tool boundary so the caller sees a
+// clear MCP error rather than an opaque upstream 400. Review finding L5.
+func validateISODate(s string) error {
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		return errors.New("must be YYYY-MM-DD")
+	}
+	return nil
+}
+
+// validateYNABMonth returns an error if s is not a valid YNAB month
+// argument (YYYY-MM-01 or the literal "current"). Review finding L6.
+func validateYNABMonth(s string) error {
+	if s == "current" {
+		return nil
+	}
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil || t.Day() != 1 {
+		return errors.New("must be YYYY-MM-01 or 'current'")
+	}
+	return nil
+}
 
 // ---- inputs / outputs -------------------------------------------------------
 
@@ -133,6 +159,9 @@ func (c *Client) GetMonth(ctx context.Context, _ *mcp.CallToolRequest, in GetMon
 	if month == "" {
 		month = "current"
 	}
+	if err := validateYNABMonth(month); err != nil {
+		return nil, Month{}, errors.New("month " + err.Error())
+	}
 	path := "/plans/" + url.PathEscape(in.PlanID) + "/months/" + url.PathEscape(month)
 	var wire wireMonthDetailResponse
 	if err := c.doJSON(ctx, path, nil, &wire); err != nil {
@@ -215,6 +244,11 @@ func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 	if in.Type != "" && in.Type != "uncategorized" && in.Type != "unapproved" {
 		return nil, ListTransactionsOutput{}, errors.New("type must be 'uncategorized' or 'unapproved'")
+	}
+	if in.SinceDate != "" {
+		if err := validateISODate(in.SinceDate); err != nil {
+			return nil, ListTransactionsOutput{}, errors.New("since_date " + err.Error())
+		}
 	}
 
 	// Fetch via the shared internal helper, which also services the
@@ -544,9 +578,12 @@ func (c *Client) ListCategories(ctx context.Context, _ *mcp.CallToolRequest, in 
 
 // ---- registration -----------------------------------------------------------
 
-// registerTools wires all 5 read-only tools into the server. All tools are
-// marked ReadOnlyHint=true so conformant MCP clients can surface them as safe
-// operations that need no user confirmation.
+// registerTools wires all read-only tools (8 primitives + 5 task-shaped
+// composition tools) into the server. All read tools are marked
+// ReadOnlyHint=true so conformant MCP clients can surface them as safe
+// operations that need no user confirmation. Write tools (create_transaction,
+// update_transaction, update_category_budgeted, approve_transaction) are
+// registered only when YNAB_ALLOW_WRITES=1.
 func registerTools(server *mcp.Server, c *Client) {
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
 
@@ -701,9 +738,26 @@ func registerTools(server *mcp.Server, c *Client) {
 // leaves a tool handler. The primary guarantee is still that no code path in
 // this package formats a token or Authorization header into an error — this
 // is belt-and-braces.
+//
+// The returned error preserves the underlying error via Unwrap so downstream
+// errors.Is checks (e.g. for context.Canceled / context.DeadlineExceeded)
+// continue to work even though Error() returns the scrubbed string. Review
+// finding H1.
 func sanitizedErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	return errors.New(sanitize(err.Error()))
+	return &sanitizedError{msg: sanitize(err.Error()), inner: err}
 }
+
+// sanitizedError is an error wrapper whose Error() returns a scrubbed string
+// but whose Unwrap() returns the original error. This preserves the error
+// chain for errors.Is / errors.As while keeping sensitive substrings out of
+// the formatted message.
+type sanitizedError struct {
+	msg   string
+	inner error
+}
+
+func (e *sanitizedError) Error() string { return e.msg }
+func (e *sanitizedError) Unwrap() error { return e.inner }

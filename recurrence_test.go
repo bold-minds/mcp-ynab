@@ -194,6 +194,40 @@ func TestFrequency_DateOnlyNormalization(t *testing.T) {
 	}
 }
 
+// TestFrequency_Monthly_Feb29LeapYear documents how monthly advancement
+// handles a Feb 29 date. Go's AddDate normalizes Feb 29 + 1 month to Mar
+// 29 (calendar-month semantics), not March 1. Review finding L1.
+func TestFrequency_Monthly_Feb29LeapYear(t *testing.T) {
+	t.Parallel()
+	// Starting Feb 29, 2024 (leap year), advance monthly. First four
+	// occurrences are Feb 29, Mar 29, Apr 29, May 29.
+	got := FrequencyOccurrences(d(2024, 2, 29), "monthly", d(2024, 2, 1), d(2024, 5, 31))
+	assertOccurrences(t, got, []string{"2024-02-29", "2024-03-29", "2024-04-29", "2024-05-29"})
+}
+
+// TestFrequency_Yearly_Feb29LeapYear documents the behavior on a yearly
+// schedule starting Feb 29 of a leap year. Go's AddDate normalizes Feb 29
+// + 1 year to Mar 1 (since Feb 2025 has only 28 days). The test locks the
+// current behavior so any future change is an explicit decision. Review
+// finding L2.
+func TestFrequency_Yearly_Feb29LeapYear(t *testing.T) {
+	t.Parallel()
+	got := FrequencyOccurrences(d(2024, 2, 29), "yearly", d(2024, 2, 1), d(2028, 3, 31))
+	// 2024-02-29 → +1yr = 2025-03-01 (normalized) → +1yr = 2026-03-01
+	//            → +1yr = 2027-03-01 → +1yr = 2028-03-01
+	assertOccurrences(t, got, []string{"2024-02-29", "2025-03-01", "2026-03-01", "2027-03-01", "2028-03-01"})
+}
+
+// TestFrequency_EveryOtherYear_Feb29LeapYear same for everyOtherYear.
+// Review finding L2.
+func TestFrequency_EveryOtherYear_Feb29LeapYear(t *testing.T) {
+	t.Parallel()
+	got := FrequencyOccurrences(d(2024, 2, 29), "everyOtherYear", d(2024, 1, 1), d(2030, 12, 31))
+	// 2024-02-29 → +2yr = 2026-03-01 (normalized from non-existent 2026-02-29)
+	//            → +2yr = 2028-03-01 → +2yr = 2030-03-01
+	assertOccurrences(t, got, []string{"2024-02-29", "2026-03-01", "2028-03-01", "2030-03-01"})
+}
+
 // ---- Enum coverage regression ----
 
 // TestFrequency_EnumValuesCovered ensures every frequency in

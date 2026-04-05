@@ -128,6 +128,19 @@ func (c *deltaCache[T]) merge(
 		c.plans[planID] = s
 	}
 
+	// Monotonicity guard: if YNAB ever returns a smaller server_knowledge
+	// than we have cached (e.g. a retry of a cached upstream response or
+	// a backend anomaly), refuse to regress. Returning the existing full
+	// set without applying the out-of-order deltas is safer than
+	// re-emitting stale entities as "new" deltas. Review finding M2.
+	if newKnowledge > 0 && newKnowledge < s.knowledge {
+		out := make([]T, 0, len(s.items))
+		for _, item := range s.items {
+			out = append(out, item)
+		}
+		return out
+	}
+
 	for _, item := range deltas {
 		id := idFn(item)
 		if id == "" {
@@ -143,13 +156,20 @@ func (c *deltaCache[T]) merge(
 		}
 	}
 
-	// Size cap: if the post-merge size would exceed the bound, flush
-	// the entire entry and fall through to returning the deltas as-is.
-	// Next call resets knowledge to 0 and does a full refetch, starting
-	// a fresh delta chain. Review finding L3.
+	// Size cap: if the post-merge size would exceed the bound, return the
+	// merged set to this caller (so they get a correct full view instead
+	// of a mere delta slice) and then flush the cache entry so the NEXT
+	// call starts a fresh delta chain from knowledge=0. Previously this
+	// returned the raw deltas, which would silently give the caller only
+	// the incremental slice when a subsequent call had passed
+	// last_knowledge_of_server. Review findings M1 and L3.
 	if len(s.items) > maxItemsPerPlanEntry {
+		out := make([]T, 0, len(s.items))
+		for _, item := range s.items {
+			out = append(out, item)
+		}
 		delete(c.plans, planID)
-		return deltas
+		return out
 	}
 
 	s.knowledge = newKnowledge

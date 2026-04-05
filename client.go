@@ -92,7 +92,7 @@ func loadToken() (Token, error) {
 		if err != nil {
 			return Token{}, fmt.Errorf("read YNAB_API_TOKEN_FILE: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		b, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes))
 		if err != nil {
 			return Token{}, fmt.Errorf("read YNAB_API_TOKEN_FILE: %w", err)
@@ -297,7 +297,7 @@ func (c *Client) doJSONWithBody(ctx context.Context, method, path string, query 
 		// to the MCP client.
 		return fmt.Errorf("ynab: request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return apiError(resp)

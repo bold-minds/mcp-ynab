@@ -356,12 +356,25 @@ func simulateAvalanche(
 		return true
 	}
 
+	// The month-by-month loop snapshots total balance before and after each
+	// iteration; if aggregate debt fails to decrease, we bail with a
+	// "did not converge" result. This catches edge cases where
+	// extraPerMonth > 0 but still insufficient to make progress — the
+	// original guard only fired on the zero-extra path. Review finding H5.
 	month := 0
 	for ; month < maxMonths; month++ {
 		if allPaidOff() {
 			break
 		}
 		monthOneBased := month + 1
+		// Compute total before this month's work so the end-of-loop
+		// progress check can compare against it.
+		var preTotal int64
+		for _, b := range balances {
+			if b > 0 {
+				preTotal += b
+			}
+		}
 
 		// Step 1: accrue interest on all accounts.
 		for i, b := range balances {
@@ -413,12 +426,19 @@ func simulateAvalanche(
 			}
 		}
 
-		// Safety: if after this month's payments nothing changed, we
-		// have aggregate negative amortization even with extra applied.
-		// Break out with an error.
-		if month > 0 && !anyProgressFromInitial(balances, initialBalances) && extraPerMonth == 0 {
-			// This should have been caught by the entry-point check, but
-			// defensive.
+		// Safety: if aggregate debt did not decrease this month, we have
+		// negative amortization even with any extra payment applied.
+		// Break out; the !allPaidOff() check below turns this into a
+		// "did not converge" error. Independent of extraPerMonth so the
+		// guard fires on insufficient-extra scenarios, not just the
+		// zero-extra path. Review finding H5.
+		var postTotal int64
+		for _, b := range balances {
+			if b > 0 {
+				postTotal += b
+			}
+		}
+		if month > 0 && postTotal >= preTotal {
 			break
 		}
 	}
@@ -457,20 +477,6 @@ func simulateAvalanche(
 		DebtFreeDate:     debtFreeDate,
 		PayoffOrder:      payoffMilestones,
 	}, nil
-}
-
-// anyProgressFromInitial reports whether at least one account has a
-// lower balance now than at the simulation start (NOT since last
-// iteration). Used as a last-ditch infinite loop guard — if the
-// avalanche simulation has not reduced any balance below its starting
-// value, we are in aggregate negative amortization and must stop.
-func anyProgressFromInitial(current, initial []int64) bool {
-	for i := range current {
-		if current[i] < initial[i] {
-			return true
-		}
-	}
-	return false
 }
 
 // countUnapprovedExcludingTransferMirrors counts pending-cleanup items
@@ -779,8 +785,11 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	}
 
 	// Scheduled next 7 days: expand recurrences via the iterator.
+	// FrequencyOccurrences treats the window as inclusive on both ends,
+	// so +6 days produces a 7-day window [today, today+6]. Previously
+	// this used +7 which silently gave 8 calendar days. Review finding M4.
 	windowStart := dateOnly(today)
-	windowEnd := windowStart.AddDate(0, 0, 7)
+	windowEnd := windowStart.AddDate(0, 0, 6)
 	var totalOutflowMu, totalInflowMu int64
 	for _, s := range schedOut.ScheduledTransactions {
 		parsedDate, err := time.Parse("2006-01-02", s.DateNext)
@@ -1124,7 +1133,16 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 
 	// Collect transactions across all requested categories via the
 	// aggregation helper (NOT the user-facing ListTransactions, which
-	// truncates at 500 rows for LLM-context reasons). De-dupe by
+	// truncates at 500 rows for LLM-context reasons). This issues one
+	// sequential category fetch per CategoryIDs entry — latency is
+	// approximately N × single-fetch latency (a few hundred ms per
+	// category in typical YNAB response time). YNAB does not expose a
+	// batch category-scoped transaction endpoint; parallelizing would
+	// risk hitting the per-token rate limit mid-call. Callers that need
+	// aggressive latency should pass fewer categories at a time. Review
+	// finding M9.
+	//
+	// De-dupe by
 	// transaction id: a split transaction might have one subtransaction
 	// under "Groceries" and another under "Restaurants" — both rows
 	// appear under their respective category scopes, but they have

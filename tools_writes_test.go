@@ -225,6 +225,39 @@ func TestCreateTransaction_AmountBoundAcceptedWithMatchingOverride(t *testing.T)
 	}
 }
 
+// TestCreateTransaction_InvalidClearedRejected is the H3 regression. YNAB
+// accepts only {cleared, uncleared, reconciled}; passing anything else
+// through would reach YNAB as an upstream 400 without a clear local error.
+func TestCreateTransaction_InvalidClearedRejected(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called for invalid cleared")
+	})
+	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
+		PlanID: "p", AccountID: "a", AmountMilliunits: -100, PayeeName: "X",
+		Cleared: "half-cleared",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cleared") {
+		t.Errorf("expected cleared enum error, got %v", err)
+	}
+}
+
+// TestCreateTransaction_PayeeIDAndNameMutuallyExclusive is the M5 regression.
+// YNAB's precedence semantics for both-set are undocumented; reject locally.
+func TestCreateTransaction_PayeeIDAndNameMutuallyExclusive(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be called when both payee_id and payee_name set")
+	})
+	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
+		PlanID: "p", AccountID: "a", AmountMilliunits: -100,
+		PayeeID: "some-id", PayeeName: "Chipotle",
+	})
+	if err == nil || !strings.Contains(err.Error(), "payee") {
+		t.Errorf("expected mutex error, got %v", err)
+	}
+}
+
 // ---- update_category_budgeted ---------------------------------------------
 
 func TestUpdateCategoryBudgeted_GateOff(t *testing.T) {
@@ -540,10 +573,12 @@ func TestRegisterTools_WritesGatedOffByEnvVar(t *testing.T) {
 	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
 	client := &Client{token: NewToken("x")}
 	registerTools(server, client)
-	// We don't have a public way to enumerate registered tools on the server
-	// object in v1.4.1, so this test is structural: registerTools must not
-	// panic and must complete. The behavioral assertion lives in the
-	// subprocess test which lists tools via the MCP protocol.
+	// Structural check only: registerTools must not panic under the
+	// gate-off branch. The go-sdk Server does not expose a public
+	// tool-enumeration API in v1.4.1, so behavioral verification that
+	// writes are NOT listed lives in TestSubprocess_WritesGatedOffWhenEnvUnset
+	// which speaks the MCP tools/list protocol against a real subprocess.
+	// Review finding L7.
 }
 
 func TestRegisterTools_WritesRegisteredWhenGateOn(t *testing.T) {
@@ -551,5 +586,8 @@ func TestRegisterTools_WritesRegisteredWhenGateOn(t *testing.T) {
 	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
 	client := &Client{token: NewToken("x")}
 	registerTools(server, client)
-	// Same as above — structural test. Subprocess test verifies tool counts.
+	// Structural check only. Behavioral verification that every write
+	// tool IS listed lives in TestSubprocess_WritesRegisteredWhenGateOn,
+	// which asserts the exact expected set of 4 write tools via MCP
+	// tools/list. Review finding L7.
 }

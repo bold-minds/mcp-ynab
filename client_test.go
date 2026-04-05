@@ -611,6 +611,38 @@ func TestDeltaSync_Transactions_UnfilteredOnly(t *testing.T) {
 	}
 }
 
+// TestDoJSON_429RateLimitedResponse is the M11 regression. YNAB returns
+// HTTP 429 when the caller exceeds the per-token rate limit; our error
+// wrapping must (a) surface the status code, (b) surface YNAB's "name"
+// field for the LLM to act on, and (c) never echo the token in the error
+// body even if the upstream response included it.
+func TestDoJSON_429RateLimitedResponse(t *testing.T) {
+	t.Parallel()
+	client, _ := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Rate-Limit", "200/200")
+		w.WriteHeader(429)
+		// Pathological: YNAB includes a bearer-shaped fragment in the
+		// detail field. apiError must scrub it.
+		_, _ = w.Write([]byte(`{"error":{"id":"429","name":"too_many_requests","detail":"rate limit hit; your Bearer sk-leaked-token exceeded quota"}}`))
+	})
+	var out struct{}
+	err := client.doJSON(context.Background(), "/plans", nil, &out)
+	if err == nil {
+		t.Fatal("expected 429 error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "429") {
+		t.Errorf("error should include status 429, got %q", msg)
+	}
+	if !strings.Contains(msg, "too_many_requests") {
+		t.Errorf("error should include YNAB name, got %q", msg)
+	}
+	if strings.Contains(msg, "sk-leaked-token") {
+		t.Errorf("REDACTION FAILURE: 429 body echoed the token into the error: %q", msg)
+	}
+}
+
 // ---- formatMilliunits -------------------------------------------------------
 
 func TestFormatMilliunits(t *testing.T) {
