@@ -80,7 +80,7 @@ type ListAccountsOutput struct {
 type ListTransactionsInput struct {
 	PlanID     string `json:"plan_id" jsonschema:"YNAB plan id (UUID), or 'last-used' / 'default'"`
 	SinceDate  string `json:"since_date,omitempty" jsonschema:"only include transactions on or after this ISO date (YYYY-MM-DD). Strongly recommended to avoid enormous responses."`
-	Type       string `json:"type,omitempty" jsonschema:"filter: 'uncategorized' or 'unapproved'. Omit for all transactions."`
+	Type       string `json:"type,omitempty" jsonschema:"optional server-side filter: exactly one of 'uncategorized' or 'unapproved'. Other values (including YNAB's upstream 'unreconciled'/'uncleared') are rejected at the tool boundary. Omit for all transactions."`
 	Limit      int    `json:"limit,omitempty" jsonschema:"max transactions to return, most recent first. Default 100, max 500."`
 	AccountID  string `json:"account_id,omitempty" jsonschema:"only include transactions for this account. At most one of account_id, category_id, or payee_id may be set."`
 	CategoryID string `json:"category_id,omitempty" jsonschema:"only include transactions for this category. Split transactions are flattened to subtransaction rows. At most one of account_id, category_id, or payee_id may be set."`
@@ -494,9 +494,14 @@ func (c *Client) ListScheduledTransactions(ctx context.Context, _ *mcp.CallToolR
 	// Filter deleted. Optional upcoming_days filter is applied via lexical
 	// ISO-date comparison because the YNAB date format (YYYY-MM-DD) sorts
 	// correctly as a string.
+	//
+	// Semantic: upcoming_days=N counts exactly N days INCLUDING today,
+	// so the cutoff is today + (N-1). Previously this used +N which
+	// gave (N+1) calendar days, inconsistent with YnabStatus's 7-day
+	// window. Review finding M8.
 	var cutoff string
 	if in.UpcomingDays > 0 {
-		cutoff = nowUTC().AddDate(0, 0, in.UpcomingDays).Format("2006-01-02")
+		cutoff = nowUTC().AddDate(0, 0, in.UpcomingDays-1).Format("2006-01-02")
 	}
 	out := ListScheduledTransactionsOutput{
 		ScheduledTransactions: make([]ScheduledTransaction, 0),
@@ -671,7 +676,7 @@ func registerTools(server *mcp.Server, c *Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ynab_status",
 		Title:       "YNAB Sunday ritual dashboard",
-		Description: "Dashboard snapshot in one call: Ready-to-Assign, overspent categories (with credit card payment categories excluded), debt accounts (enriched with APR and monthly interest when debt_account_config is provided), savings accounts, days-since-last-reconciled per account, unapproved transaction count, and next-7-days scheduled transaction cash flow with recurrence expansion.",
+		Description: "Dashboard snapshot in one call: Ready-to-Assign, overspent categories (with credit card payment categories excluded), debt accounts (enriched with APR and monthly interest when debt_account_config is provided), liquid accounts (checking + savings + cash), days-since-last-reconciled per on-budget account, unapproved transaction count, and next-7-days scheduled transaction cash flow with recurrence expansion.",
 		Annotations: readOnly,
 	}, c.YnabStatus)
 
@@ -688,17 +693,24 @@ func registerTools(server *mcp.Server, c *Client) {
 	// handler also performs a per-call re-check as defense-in-depth.
 	if writeAllowed() {
 		destructive := false
-		idempotent := true
-		mutating := &mcp.ToolAnnotations{
+		// create_transaction is NOT idempotent by default. YNAB dedupes
+		// server-side only when the caller provides an import_id; without
+		// one, a retry double-posts. We advertise idempotent=false so a
+		// conformant orchestrator never silently retries on transient
+		// errors. The import_id field in the input schema is how callers
+		// opt into idempotent-on-retry semantics — it is guidance to the
+		// caller, not a global property of the tool. Review finding H1.
+		createTxnIdempotent := false
+		createTxnMutating := &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
-			DestructiveHint: &destructive, // creates new entities, doesn't destroy
-			IdempotentHint:  idempotent,   // import_id-based dedup at YNAB
+			DestructiveHint: &destructive,
+			IdempotentHint:  createTxnIdempotent,
 		}
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "create_transaction",
 			Title:       "Create transaction",
-			Description: "Create a new transaction in YNAB. Requires YNAB_ALLOW_WRITES=1. Asks the MCP client to confirm before executing. Amounts >$10K require an echo-back amount_override_milliunits acknowledgment. Provide an import_id to dedupe idempotently on retry.",
-			Annotations: mutating,
+			Description: "Create a new transaction in YNAB. Requires YNAB_ALLOW_WRITES=1. Asks the MCP client to confirm before executing. Amounts >$10K require an echo-back amount_override_milliunits acknowledgment. NOT idempotent by default — a retry without an import_id double-posts. Pass import_id to dedupe idempotently on retry (YNAB dedupes server-side on that key).",
+			Annotations: createTxnMutating,
 		}, c.CreateTransaction)
 
 		destructiveBudget := false
@@ -744,10 +756,31 @@ func registerTools(server *mcp.Server, c *Client) {
 // continue to work even though Error() returns the scrubbed string. Review
 // finding H1.
 func sanitizedErr(err error) error {
+	return sanitizedErrWith(err)
+}
+
+// sanitizedErrWith is like sanitizedErr but also redacts the given
+// user-provided string values from the error surface. Use it in write-
+// path handlers to strip caller-supplied content (memos, payee names)
+// that a compromised or pathological downstream transport could echo
+// into an error message. Empty strings in the variadic list are
+// ignored. Review nit / client_test.go leak enforcement.
+func sanitizedErrWith(err error, redactValues ...string) error {
 	if err == nil {
 		return nil
 	}
-	return &sanitizedError{msg: sanitize(err.Error()), inner: err}
+	s := sanitize(err.Error())
+	for _, v := range redactValues {
+		if len(v) < 4 {
+			// Short strings (e.g. "X", "a") are too likely to produce
+			// false-positive matches on common error words. The
+			// threshold is conservative — real memos and payee names
+			// are longer than 4 chars.
+			continue
+		}
+		s = strings.ReplaceAll(s, v, "[REDACTED]")
+	}
+	return &sanitizedError{msg: s, inner: err}
 }
 
 // sanitizedError is an error wrapper whose Error() returns a scrubbed string

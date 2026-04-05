@@ -97,6 +97,10 @@ func checkAmountBound(amount, override int64) error {
 	if override == amount {
 		return nil
 	}
+	// Message wording matches the <= boundary check above: "exceeds"
+	// describes values strictly greater than the threshold (|amount| >
+	// amountBoundMilliunits). The boundary itself is a pass. Review
+	// nit about message/operator alignment.
 	return fmt.Errorf(
 		"amount %d milliunits exceeds the %d milliunit safety threshold; "+
 			"to confirm, re-invoke with amount_override_milliunits set to exactly %d",

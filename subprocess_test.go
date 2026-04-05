@@ -407,20 +407,12 @@ func TestSubprocess_SDKValidatesMissingRequiredArg(t *testing.T) {
 	}
 }
 
-// TestSubprocess_HandlerFallbackOnBypass is a belt-and-braces test. The SDK
-// validation fires before the handler in the normal path (proved above),
-// but the handler also contains its own plan_id check as defense-in-depth.
-// If someone in the future alters tool registration to use the lower-level
-// Server.AddTool (which skips schema validation), the handler must still
-// reject the call. We cannot easily simulate that via subprocess, so this
-// documents the intent and the unit test on ListAccounts with an empty
-// ListAccountsInput covers the fallback path directly.
-func TestSubprocess_HandlerFallbackOnBypass(t *testing.T) {
-	t.Parallel()
-	// The unit test TestGetMonth_RequiresPlanID and analogous checks
-	// in tools_test.go cover this. Leaving this doc test here as a marker.
-	t.Skip("covered by handler-level unit tests; left as documentation")
-}
+// Handler-level fallback checks (empty plan_id, missing required fields)
+// are covered by unit tests against each handler method directly — see
+// TestGetMonth_RequiresPlanID and analogous checks in tools_test.go /
+// tools_tasks_test.go / tools_writes_test.go. An earlier version of this
+// file held a t.Skip() stub marker that served no purpose beyond
+// documentation; removed per review nit about dead tests.
 
 // TestSubprocess_StoreTokenReadsStdin exercises the store-token subcommand.
 // It does NOT actually talk to the OS keyring (which may not be present on

@@ -18,8 +18,12 @@
 //     every4Weeks) are mathematically exact.
 //   - Frequencies based on calendar months (monthly, everyOtherMonth,
 //     every3Months, every4Months, twiceAYear, yearly, everyOtherYear) use
-//     time.Time.AddDate which handles month-length variance correctly
-//     (e.g., Jan 31 + 1 month = Mar 3, not Feb 31).
+//     time.Time.AddDate which handles month-length variance via Go's
+//     standard normalization. Jan 31 + 1 month rolls forward to the
+//     equivalent day of the following month: Mar 3 in non-leap years,
+//     Mar 2 in leap years (since Feb 29 exists). Callers that need
+//     strict "anchor to the last day of month" semantics should compute
+//     them externally.
 //   - `twiceAMonth` is approximated as 15-day advance. The YNAB app
 //     actually uses two user-chosen days per month (e.g., the 1st and
 //     15th, or the 5th and 20th), but the API does not expose the anchor
@@ -156,20 +160,19 @@ func advanceByFrequency(t time.Time, frequency string) time.Time {
 }
 
 // isKnownFrequency reports whether freq is in the canonical YNAB
-// frequency enum.
+// frequency enum. Backed by a map for O(1) lookup — the slice form is
+// preserved separately for tests that need a deterministic iteration
+// order over all enum values. Review nit.
 func isKnownFrequency(freq string) bool {
-	for _, k := range knownFrequencies {
-		if k == freq {
-			return true
-		}
-	}
-	return false
+	_, ok := knownFrequencySet[freq]
+	return ok
 }
 
 // knownFrequencies is the complete set of YNAB scheduled-transaction
 // frequency enum values as of the YNAB OpenAPI spec verified at v0.2
 // development time. Any change to this list requires a matching update
-// to advanceByFrequency AND the enum coverage test.
+// to advanceByFrequency, knownFrequencySet below, AND the enum coverage
+// test.
 var knownFrequencies = []string{
 	"never",
 	"daily",
@@ -185,6 +188,16 @@ var knownFrequencies = []string{
 	"yearly",
 	"everyOtherYear",
 }
+
+// knownFrequencySet is the map form of knownFrequencies for O(1) lookup
+// in the FrequencyOccurrences hot path. Kept in sync via the init below.
+var knownFrequencySet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(knownFrequencies))
+	for _, f := range knownFrequencies {
+		m[f] = struct{}{}
+	}
+	return m
+}()
 
 // dateOnly returns t converted to UTC with its time components zeroed.
 // Normalizing to a single location matters because FrequencyOccurrences

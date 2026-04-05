@@ -1,0 +1,56 @@
+# .dockerignore — keep build-context minimal and prevent leaking dev-time
+# files into intermediate Docker layers. Review finding H9.
+#
+# The final distroless image (see Dockerfile) is clean regardless of what
+# is COPYed in the builder stage, but the builder stage's layer is still
+# pushed to the registry in some flows and should not contain git
+# history, test code, docs, or local secrets.
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Tests, benchmarks, and test fixtures
+**/*_test.go
+**/testdata/
+
+# Docs and examples (not needed to build the binary)
+docs/
+examples/
+*.md
+CHANGELOG.md
+LICENSE
+SECURITY.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+
+# Editor/IDE state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# CI / workflow files
+.github/
+.goreleaser.yaml
+.golangci.yml
+
+# Local dev artifacts
+mcp-ynab
+mcp-ynab-*
+coverage.out
+*.log
+
+# Local secrets — defense in depth; none of these should exist in-tree
+.env
+.env.*
+*.pem
+*.key
+token
+secrets/

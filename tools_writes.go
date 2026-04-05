@@ -55,7 +55,10 @@ type CreateTransactionInput struct {
 	PayeeName  string `json:"payee_name,omitempty" jsonschema:"payee name; one of payee_name or payee_id is required. New payees are created automatically if the name does not match an existing payee."`
 	PayeeID    string `json:"payee_id,omitempty" jsonschema:"payee id (UUID); one of payee_name or payee_id is required"`
 	CategoryID string `json:"category_id,omitempty" jsonschema:"category id (UUID); transaction is uncategorized if omitted"`
-	Memo       string `json:"memo,omitempty" jsonschema:"freeform memo, max 200 characters"`
+	// Memo is capped at 200 characters on create — this is a project
+	// policy (not YNAB's limit, which is 500). Create-time memos should
+	// be short descriptive strings; longer context belongs on update.
+	Memo       string `json:"memo,omitempty" jsonschema:"freeform memo, max 200 characters (project policy; YNAB's server limit is 500)"`
 	Date       string `json:"date,omitempty" jsonschema:"ISO date (YYYY-MM-DD); defaults to today (UTC) if omitted"`
 	Cleared    string `json:"cleared,omitempty" jsonschema:"cleared|uncleared|reconciled; defaults to 'uncleared'"`
 	Approved   *bool  `json:"approved,omitempty" jsonschema:"defaults to true; pass false to leave the transaction unapproved"`
@@ -182,13 +185,19 @@ type wireNewTransaction struct {
 }
 
 // wireSaveTransactionsResponse matches YNAB's SaveTransactionsResponse
-// schema for the single-transaction variant. The bulk variant populates
-// .data.transactions[] and .data.duplicate_import_ids[], which we do not
-// use — single-transaction POST always populates .data.transaction.
+// schema. For a single-transaction POST, YNAB populates .data.transaction
+// on a fresh insert. On the retry-dedup path (same import_id as a prior
+// post), YNAB instead returns the duplicate id in .data.duplicate_import_ids
+// and may leave .data.transaction zero-valued. We decode both fields so
+// the handler can detect the dedup case and surface it explicitly rather
+// than returning a zero-value Transaction with ID="" masquerading as
+// success. Review finding H2.
 type wireSaveTransactionsResponse struct {
 	Data struct {
-		Transaction    wireTransaction `json:"transaction"`
-		TransactionIDs []string        `json:"transaction_ids"`
+		Transaction        wireTransaction `json:"transaction"`
+		Transactions       []wireTransaction `json:"transactions"`
+		TransactionIDs     []string        `json:"transaction_ids"`
+		DuplicateImportIDs []string        `json:"duplicate_import_ids"`
 	} `json:"data"`
 }
 
@@ -277,6 +286,15 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if in.ImportID != "" && len(in.ImportID) > 36 {
 		return nil, CreateTransactionOutput{}, errors.New("import_id must be at most 36 characters")
 	}
+	// Validate date if supplied; fall-through defaults to today (UTC)
+	// below. Catches LLM-generated strings like "yesterday" or
+	// "2026-13-01" at the boundary instead of YNAB returning an opaque
+	// http 400. Review finding H3.
+	if in.Date != "" {
+		if err := validateISODate(in.Date); err != nil {
+			return nil, CreateTransactionOutput{}, errors.New("date " + err.Error())
+		}
+	}
 	// Validate cleared enum if caller supplied it. YNAB's API accepts only
 	// these three values; pre-validating here gives a clear error instead
 	// of a generic upstream 400. Matches the equivalent check in
@@ -297,6 +315,18 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 		return nil, CreateTransactionOutput{}, sanitizedErr(err)
 	}
 
+	// Pre-fetch the target account so the elicitation message can show
+	// a human-readable name instead of an opaque UUID. The user has to
+	// be able to eyeball "is this the right account?" during
+	// confirmation. If the account fetch fails (network error, wrong
+	// id), fall back to the id and let the user decide. Review finding M9.
+	acctPath := "/plans/" + url.PathEscape(in.PlanID) + "/accounts/" + url.PathEscape(in.AccountID)
+	var preAcctWire wireSingleAccountResponse
+	accountLabel := in.AccountID
+	if err := c.doJSON(ctx, acctPath, nil, &preAcctWire); err == nil && preAcctWire.Data.Account.Name != "" {
+		accountLabel = fmt.Sprintf("%q (%s)", preAcctWire.Data.Account.Name, in.AccountID)
+	}
+
 	// Elicit confirmation with a specific summary. The exact message is
 	// what the user sees on their MCP client.
 	msg := fmt.Sprintf(
@@ -304,7 +334,7 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 		formatSignedMoney(in.AmountMilliunits),
 		orDefault(in.Date, nowUTC().Format("2006-01-02")),
 		orDefault(in.PayeeName, in.PayeeID),
-		in.AccountID,
+		accountLabel,
 	)
 	if err := elicitConfirmation(ctx, req.Session, msg); err != nil {
 		return nil, CreateTransactionOutput{}, sanitizedErr(err)
@@ -356,21 +386,51 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	path := "/plans/" + url.PathEscape(in.PlanID) + "/transactions"
 	var wire wireSaveTransactionsResponse
 	if err := c.doJSONWithBody(ctx, http.MethodPost, path, nil, body, &wire); err != nil {
-		return nil, CreateTransactionOutput{}, sanitizedErr(err)
+		// Scrub caller-provided strings from the error surface. If a
+		// pathological transport echoes the request body verbatim (or
+		// YNAB's own error detail happens to contain the memo), the
+		// extra redaction prevents user-submitted content from reaching
+		// the MCP client. The environment-level sanitize() handles
+		// Bearer/Authorization patterns; this additional scrub handles
+		// memo and payee_name.
+		return nil, CreateTransactionOutput{}, sanitizedErrWith(err, in.Memo, in.PayeeName)
+	}
+
+	// Dedup detection: YNAB may return the transaction either as
+	// .data.transaction (fresh insert) or as the first element of
+	// .data.transactions (bulk-shape response). On the import_id retry
+	// path, .data.transaction is zero-valued and .data.duplicate_import_ids
+	// carries the original id. We MUST NOT return a zero-value
+	// Transaction{} — that would look like success with ID="". Review
+	// finding H2.
+	txn := wire.Data.Transaction
+	if txn.ID == "" && len(wire.Data.Transactions) > 0 {
+		txn = wire.Data.Transactions[0]
+	}
+	if txn.ID == "" {
+		if len(wire.Data.DuplicateImportIDs) > 0 {
+			return nil, CreateTransactionOutput{}, fmt.Errorf(
+				"create_transaction: YNAB returned duplicate_import_ids (import_id already used); "+
+					"the prior transaction with this import_id was not modified. "+
+					"To post a new transaction, use a fresh import_id. Duplicates reported: %v",
+				wire.Data.DuplicateImportIDs)
+		}
+		return nil, CreateTransactionOutput{}, errors.New(
+			"create_transaction: YNAB response contained no transaction id — refusing to report success")
 	}
 
 	out := CreateTransactionOutput{
-		Transaction: toTransaction(wire.Data.Transaction),
+		Transaction: toTransaction(txn),
 		Before:      nil,
 	}
 
 	// Fetch the account balance for the "after" snapshot. If this fails,
 	// we still return a successful result — the transaction itself was
 	// created, and the response's Transaction.ID identifies it.
-	acctPath := "/plans/" + url.PathEscape(in.PlanID) + "/accounts/" + url.PathEscape(in.AccountID)
-	var acctWire wireSingleAccountResponse
-	if err := c.doJSON(ctx, acctPath, nil, &acctWire); err == nil {
-		balance := NewMoney(acctWire.Data.Account.Balance)
+	// Re-use acctPath from the pre-fetch step above.
+	var postAcctWire wireSingleAccountResponse
+	if err := c.doJSON(ctx, acctPath, nil, &postAcctWire); err == nil {
+		balance := NewMoney(postAcctWire.Data.Account.Balance)
 		out.After = &balance
 	}
 	return nil, out, nil
@@ -397,6 +457,13 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	if err := validateYNABMonth(month); err != nil {
 		return nil, UpdateCategoryBudgetedOutput{}, errors.New("month " + err.Error())
 	}
+	// YNAB's PATCH month-category docs enumerate only ISO dates in the
+	// URL path — "current" is a GET convenience only. Resolve to a
+	// concrete YYYY-MM-01 before building the URL so PATCH gets a
+	// documented value. Review finding H4.
+	if month == "current" {
+		month = nowUTC().Format("2006-01") + "-01"
+	}
 	if err := checkAmountBound(in.NewBudgetedMilliunits, in.AmountOverrideMilliunits); err != nil {
 		return nil, UpdateCategoryBudgetedOutput{}, sanitizedErr(err)
 	}
@@ -418,12 +485,14 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	}
 
 	// Elicit confirmation AFTER we know the "before" state so the user
-	// sees the exact delta.
+	// sees the exact delta. The category note is omitted from the
+	// confirmation summary — notes can contain sensitive or long text
+	// and would otherwise land in elicitation logs. The user can verify
+	// the category by its name alone. Review finding M10.
 	delta := in.NewBudgetedMilliunits - beforeWire.Data.Category.Budgeted
 	msg := fmt.Sprintf(
-		"Update YNAB category budgeted: %q (%s) from %s to %s (change: %s)",
+		"Update YNAB category budgeted: %q from %s to %s (change: %s)",
 		beforeWire.Data.Category.Name,
-		deref(beforeWire.Data.Category.Note),
 		formatSignedMoney(beforeWire.Data.Category.Budgeted),
 		formatSignedMoney(in.NewBudgetedMilliunits),
 		formatSignedMoney(delta),

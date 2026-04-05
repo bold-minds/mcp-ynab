@@ -16,6 +16,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -51,8 +52,12 @@ func (t Token) Format(f fmt.State, _ rune) {
 }
 
 // MarshalJSON always returns the placeholder, never the underlying value.
+// Uses json.Marshal to produce a properly-quoted string rather than
+// hand-concatenating; the result is identical for the current placeholder
+// but survives any future change to redactedPlaceholder that includes a
+// quote or backslash. Review nit.
 func (t Token) MarshalJSON() ([]byte, error) {
-	return []byte(`"` + redactedPlaceholder + `"`), nil
+	return json.Marshal(redactedPlaceholder)
 }
 
 // UnmarshalJSON refuses. A Token should only ever be constructed from a

@@ -113,6 +113,11 @@ func TestCreateTransaction_HappyPath(t *testing.T) {
 }
 
 func TestCreateTransaction_DefaultDateIsToday(t *testing.T) {
+	// Freeze the clock so the asserted default date is deterministic
+	// across midnight UTC boundaries. Review finding H8.
+	frozen := time.Date(2027, 5, 20, 12, 0, 0, 0, time.UTC)
+	setNowUTC(func() time.Time { return frozen })
+	t.Cleanup(resetNowUTC)
 	t.Setenv(envAllowWrites, "1")
 	var seenBody map[string]any
 	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -136,9 +141,9 @@ func TestCreateTransaction_DefaultDateIsToday(t *testing.T) {
 		t.Fatal(err)
 	}
 	txn := seenBody["transaction"].(map[string]any)
-	today := time.Now().UTC().Format("2006-01-02")
-	if txn["date"] != today {
-		t.Errorf("expected default date %s, got %v", today, txn["date"])
+	expected := frozen.Format("2006-01-02")
+	if txn["date"] != expected {
+		t.Errorf("expected default date %s, got %v", expected, txn["date"])
 	}
 }
 
@@ -274,6 +279,11 @@ func TestUpdateCategoryBudgeted_GateOff(t *testing.T) {
 }
 
 func TestUpdateCategoryBudgeted_HappyPathReturnsBeforeAndAfter(t *testing.T) {
+	// Freeze the clock so the "current" → YYYY-MM-01 resolution in
+	// H4 produces a deterministic URL path for this assertion.
+	frozen := time.Date(2027, 5, 10, 12, 0, 0, 0, time.UTC)
+	setNowUTC(func() time.Time { return frozen })
+	t.Cleanup(resetNowUTC)
 	t.Setenv(envAllowWrites, "1")
 	var seenPaths []string
 	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -301,14 +311,17 @@ func TestUpdateCategoryBudgeted_HappyPathReturnsBeforeAndAfter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Verify the two expected requests happened in order.
+	// Verify the two expected requests happened in order. The URL uses
+	// the frozen-clock-resolved YYYY-MM-01 form (H4) — "current" is a
+	// GET convenience only; PATCH requires an ISO date.
 	if len(seenPaths) != 2 {
 		t.Fatalf("expected 2 requests (GET then PATCH), got %d: %v", len(seenPaths), seenPaths)
 	}
-	if seenPaths[0] != "GET /plans/plan-1/months/current/categories/cat-1" {
+	const wantMonthPath = "/plans/plan-1/months/2027-05-01/categories/cat-1"
+	if seenPaths[0] != "GET "+wantMonthPath {
 		t.Errorf("first request wrong: %s", seenPaths[0])
 	}
-	if seenPaths[1] != "PATCH /plans/plan-1/months/current/categories/cat-1" {
+	if seenPaths[1] != "PATCH "+wantMonthPath {
 		t.Errorf("second request wrong: %s", seenPaths[1])
 	}
 	// Verify before/after snapshots
@@ -457,6 +470,66 @@ func TestUpdateTransaction_HappyPathSingleField(t *testing.T) {
 	// Other fields not touched should be nil in the snapshots.
 	if out.Before.CategoryID != nil || out.Before.Approved != nil {
 		t.Errorf("snapshot should only contain touched fields, got before=%+v", out.Before)
+	}
+}
+
+// TestUpdateTransaction_PUTBodyOmitsUntouchedFields is the M11 regression.
+// update_transaction relies on YNAB's documented "omitted JSON field =
+// leave unchanged" semantics. This test asserts that a single-field
+// update produces a PUT body with ONLY that field in the transaction
+// object — nothing else. Any drift where we started sending nil as JSON
+// null (which YNAB would interpret as "clear the field") would show up
+// here as a silent data-corruption regression.
+func TestUpdateTransaction_PUTBodyOmitsUntouchedFields(t *testing.T) {
+	t.Setenv(envAllowWrites, "1")
+	var putBody map[string]any
+	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte(`{"data":{"transaction":{
+				"id":"t1","date":"2026-04-05","amount":-5000,
+				"memo":"original memo","cleared":"cleared","approved":true,
+				"flag_color":"red","account_id":"a","account_name":"Checking",
+				"payee_id":"pay-1","payee_name":"Target",
+				"category_id":"cat-1","category_name":"Shopping","deleted":false
+			}}}`))
+		case http.MethodPut:
+			_ = json.NewDecoder(r.Body).Decode(&putBody)
+			_, _ = w.Write([]byte(`{"data":{"transaction":{
+				"id":"t1","date":"2026-04-05","amount":-5000,
+				"memo":"new memo","cleared":"cleared","approved":true,
+				"flag_color":"red","account_id":"a","account_name":"Checking",
+				"payee_id":"pay-1","payee_name":"Target",
+				"category_id":"cat-1","category_name":"Shopping","deleted":false
+			}}}`))
+		}
+	})
+	newMemo := "new memo"
+	if _, _, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
+		PlanID: "plan-1", TransactionID: "t1", Memo: &newMemo,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	txn, ok := putBody["transaction"].(map[string]any)
+	if !ok {
+		t.Fatalf("PUT body missing transaction object: %+v", putBody)
+	}
+	// Only the memo field must be present. Anything else means we'd be
+	// overwriting untouched fields on the YNAB side.
+	if len(txn) != 1 {
+		t.Errorf("PUT transaction body must contain exactly 1 field (memo); got %d: %+v", len(txn), txn)
+	}
+	if txn["memo"] != "new memo" {
+		t.Errorf("memo not set correctly: %+v", txn)
+	}
+	// Exhaustive absence check — these are the fields that are mutable
+	// via update_transaction, so they must not appear unless the caller
+	// asked to change them.
+	for _, forbidden := range []string{"category_id", "payee_id", "payee_name", "approved", "cleared", "flag_color", "amount", "account_id", "date"} {
+		if _, present := txn[forbidden]; present {
+			t.Errorf("PUT body must not include %q when caller did not touch it, got %+v", forbidden, txn)
+		}
 	}
 }
 

@@ -194,10 +194,19 @@ func TestDeltaCache_ConcurrentMergeAndRead(t *testing.T) {
 				}
 			}
 			// All workers use the same server_knowledge value so the
-			// monotonicity guard (M2) does not skip a worker whose
-			// goroutine happens to run after a higher-knowledge worker.
-			// Real YNAB usage is sequential, not concurrent, so the
+			// monotonicity guard does not skip a worker whose goroutine
+			// happens to run after a higher-knowledge worker. Real
+			// YNAB usage is sequential, not concurrent, so the
 			// out-of-order case is a synthetic-test artifact.
+			//
+			// This test's correctness depends on the monotonicity
+			// guard using STRICTLY LESS THAN (`newKnowledge < s.knowledge`)
+			// rather than `<=`. With `<=`, a second writer arriving
+			// with the same knowledge value would be rejected and its
+			// 20 entities would never enter the cache, producing a
+			// flaky size!=200 failure. The guard in delta.go is `<`;
+			// do not change to `<=` without rewriting this test.
+			// Review nit.
 			c.merge(planID, 1000, items, testID, testDeleted)
 		}(w)
 	}

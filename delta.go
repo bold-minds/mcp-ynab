@@ -128,12 +128,16 @@ func (c *deltaCache[T]) merge(
 		c.plans[planID] = s
 	}
 
-	// Monotonicity guard: if YNAB ever returns a smaller server_knowledge
-	// than we have cached (e.g. a retry of a cached upstream response or
-	// a backend anomaly), refuse to regress. Returning the existing full
-	// set without applying the out-of-order deltas is safer than
-	// re-emitting stale entities as "new" deltas. Review finding M2.
-	if newKnowledge > 0 && newKnowledge < s.knowledge {
+	// Monotonicity guard: if YNAB ever returns a server_knowledge smaller
+	// than we have cached (e.g. a retry of a cached upstream response, a
+	// backend anomaly, or a zero reset), refuse to regress. Returning
+	// the existing full set without applying the out-of-order deltas is
+	// safer than re-emitting stale entities as "new" deltas. The guard
+	// INCLUDES newKnowledge == 0 because a zero after we have positive
+	// state is equally non-monotonic — the previous version bypassed 0
+	// and then partially applied deltas with a zeroed knowledge, leaking
+	// stale state. Review finding M1.
+	if s.knowledge > 0 && newKnowledge < s.knowledge {
 		out := make([]T, 0, len(s.items))
 		for _, item := range s.items {
 			out = append(out, item)

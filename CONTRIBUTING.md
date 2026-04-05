@@ -4,7 +4,7 @@ Thanks for your interest in contributing. This project is deliberately small and
 
 ## Ground rules
 
-1. **Read-only stays read-only in v0.1.x.** Write tools are planned for v0.2 behind an explicit opt-in (`YNAB_ALLOW_WRITES=1`) with per-call confirmation via MCP elicitation. PRs that add write tools to v0.1.x will be closed.
+1. **Write tools are gated behind `YNAB_ALLOW_WRITES=1`.** As of v0.2.0 (shipped 2026-04-04) the server supports create/update/approve transactions and update category budgeted, but **only** when the env var is set at startup — otherwise they are not registered and cannot be invoked. PRs that relax this gate or introduce new writes without confirmation elicitation will be closed.
 2. **No new dependencies without a compelling reason.** Every dep is an attack surface. The current set is intentionally minimal (MCP SDK, `golang.org/x/time/rate`, `go-keyring`, and their transitives). A PR adding a new direct dependency should explain in the description why a stdlib solution will not work.
 3. **Security-sensitive files require extra scrutiny.** `token.go`, `client.go`, and `errors.go` touch the credential handling path. Changes to these files should include a test that demonstrates the new behavior does not leak the token.
 4. **Never log or format the token directly.** The `Token.reveal()` method is called in exactly one place (setting the `Authorization` header). New callers are a security change that must be justified in the PR description.

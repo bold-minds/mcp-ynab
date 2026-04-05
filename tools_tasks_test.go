@@ -895,9 +895,11 @@ func statusHandler(withDebtConfig bool) http.HandlerFunc {
 			]}}`))
 		case strings.HasSuffix(p, "/scheduled_transactions"):
 			// A monthly rent scheduled for tomorrow + a weekly schedule
-			// for 2 days from now.
-			tomorrow := time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02")
-			inTwoDays := time.Now().UTC().AddDate(0, 0, 2).Format("2006-01-02")
+			// for 2 days from now. Uses nowUTC() (not time.Now()) so a
+			// test that freezes the clock produces deterministic dates
+			// across midnight boundaries. Review finding H8.
+			tomorrow := nowUTC().AddDate(0, 0, 1).Format("2006-01-02")
+			inTwoDays := nowUTC().AddDate(0, 0, 2).Format("2006-01-02")
 			body := `{"data":{"scheduled_transactions":[
 				{"id":"s-rent","date_first":"2026-01-01","date_next":"` + tomorrow + `","frequency":"monthly","amount":-1500000,"account_id":"acct-check","account_name":"Checking","payee_name":"Landlord","deleted":false},
 				{"id":"s-weekly","date_first":"2026-01-01","date_next":"` + inTwoDays + `","frequency":"weekly","amount":-50000,"account_id":"acct-check","account_name":"Checking","payee_name":"Subscription","deleted":false}

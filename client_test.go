@@ -314,8 +314,15 @@ func TestLogLeak_WriteBodyNotEchoedInError(t *testing.T) {
 	t.Setenv(envAllowWrites, "1")
 	const secretMemo = "PRIVATE-MEMO-CONTENT-do-not-echo-xyz789"
 
-	// Evil RT that includes the request body verbatim in the error.
+	// Evil RT that includes the request body verbatim in the error
+	// for any request that has a body. Requests without a body (GETs
+	// like the pre-fetch CreateTransaction does to resolve account
+	// names for elicitation) get a generic transport error so the
+	// test only exercises the POST path where the memo could leak.
 	evilRT := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Body == nil || req.Body == http.NoBody {
+			return nil, fmt.Errorf("transport-error (no body)")
+		}
 		buf := make([]byte, 2048)
 		n, _ := req.Body.Read(buf)
 		return nil, fmt.Errorf("transport-error body=%s", string(buf[:n]))
@@ -343,10 +350,14 @@ func TestLogLeak_WriteBodyNotEchoedInError(t *testing.T) {
 	if !strings.Contains(msg, "transport-error") {
 		t.Errorf("error should include the underlying transport message, got %q", msg)
 	}
-	// Log whether the memo currently leaks so a future scrub improvement
-	// flips this expectation visibly.
+	// Hard assertion (review nit): the memo MUST NOT appear in the
+	// error surface. CreateTransaction's error wrapper
+	// (sanitizedErrWith) redacts in.Memo and in.PayeeName before the
+	// error leaves the handler, so even a pathological transport that
+	// echoes the request body cannot leak caller-submitted content to
+	// the MCP client.
 	if strings.Contains(msg, secretMemo) {
-		t.Logf("NOTE: memo content currently appears in error path; sanitize() does not scrub arbitrary body fields. If we add broader scrubbing in a future release, update this test.")
+		t.Errorf("REDACTION FAILURE: memo content leaked into error surface: %q", msg)
 	}
 }
 

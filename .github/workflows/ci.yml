@@ -40,6 +40,20 @@ jobs:
       - name: Test (race + coverage)
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
+      - name: Coverage threshold gate
+        # Review finding M13. Fail the build if total package coverage
+        # drops below the documented floor. 70% is below current real
+        # coverage to leave room for refactors but catches catastrophic
+        # drops like a PR that deletes a whole test file. Adjust by
+        # editing this step with intention.
+        env:
+          COVERAGE_FLOOR: "70.0"
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
+          echo "Total coverage: ${total}% (floor: ${COVERAGE_FLOOR}%)"
+          awk -v t="$total" -v f="$COVERAGE_FLOOR" 'BEGIN { exit (t+0 < f+0) ? 1 : 0 }' \
+            || { echo "::error::coverage ${total}% < floor ${COVERAGE_FLOOR}%"; exit 1; }
+
       - name: Upload coverage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:

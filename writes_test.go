@@ -15,22 +15,28 @@ func TestWriteAllowed_OnlyExactlyOneEnables(t *testing.T) {
 	// Cannot use t.Parallel() here — subtests use t.Setenv, which is
 	// incompatible with parallel ancestors because env vars are
 	// process-global state.
-	cases := map[string]bool{
-		"":      false,
-		"0":     false,
-		"1":     true,
-		"2":     false,
-		"true":  false, // deliberately strict — only "1" enables
-		"TRUE":  false,
-		"yes":   false,
-		"  1  ": false, // no trimming; whitespace-surrounded is not "1"
+	//
+	// Slice (not map) so failure output iteration order is stable across
+	// runs. Review nit.
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"0", false},
+		{"1", true},
+		{"2", false},
+		{"true", false}, // deliberately strict — only "1" enables
+		{"TRUE", false},
+		{"yes", false},
+		{"  1  ", false}, // no trimming; whitespace-surrounded is not "1"
 	}
-	for in, want := range cases {
+	for _, c := range cases {
 		// Subtests use t.Setenv which resets at the end of the subtest.
-		t.Run("val="+in, func(t *testing.T) {
-			t.Setenv(envAllowWrites, in)
-			if got := writeAllowed(); got != want {
-				t.Errorf("writeAllowed() with %q = %v; want %v", in, got, want)
+		t.Run("val="+c.in, func(t *testing.T) {
+			t.Setenv(envAllowWrites, c.in)
+			if got := writeAllowed(); got != c.want {
+				t.Errorf("writeAllowed() with %q = %v; want %v", c.in, got, c.want)
 			}
 		})
 	}

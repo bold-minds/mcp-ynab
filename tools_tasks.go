@@ -98,7 +98,7 @@ type YnabDebtSnapshotOutput struct {
 	AsOfDate             string                 `json:"as_of_date"`
 	TotalBalance         Money                  `json:"total_balance"`
 	TotalMonthlyInterest Money                  `json:"total_monthly_interest"`
-	AnnualInterestCost   Money                  `json:"annual_interest_cost" jsonschema:"simple annualization of current monthly interest; not a simulation"`
+	AnnualInterestCost   Money                  `json:"annual_interest_cost" jsonschema:"simple 12× annualization of current monthly interest; NOT the true compounded annual cost. Under-reports by ~9% at 27% APR vs an effective-annual-rate computation. Use as a ballpark only."`
 	Accounts             []DebtAccountSnapshot  `json:"accounts"`
 	ProjectionMinimumsOnly *DebtPayoffProjection `json:"projection_minimums_only,omitempty"`
 	ProjectionWithExtra    *DebtPayoffProjection `json:"projection_with_extra,omitempty"`
@@ -131,7 +131,7 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 		)
 	}
 
-	// Validate APRs.
+	// Validate APRs and minimum payments.
 	for _, cfg := range in.DebtAccountConfig {
 		if cfg.AccountID == "" {
 			return nil, YnabDebtSnapshotOutput{}, errors.New("every debt_account_config entry must have account_id")
@@ -141,6 +141,14 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 		}
 		if cfg.APRPercent > 1000 {
 			return nil, YnabDebtSnapshotOutput{}, fmt.Errorf("apr_percent %v looks wrong (account %s) — expected a percent like 27.15, not a fraction", cfg.APRPercent, cfg.AccountID)
+		}
+		// Negative minimum would cause the simulation's Step 2 to
+		// ADD to the balance instead of subtracting, which would
+		// produce an infinite-growth loop until the 600-month cap
+		// fires. Catch it at the boundary with a clear message.
+		// Review nit.
+		if cfg.MinimumPaymentMilliunits < 0 {
+			return nil, YnabDebtSnapshotOutput{}, fmt.Errorf("minimum_payment_milliunits must be non-negative (account %s)", cfg.AccountID)
 		}
 	}
 
@@ -225,14 +233,22 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 	for _, m := range minimums {
 		totalMinimumsMu += m
 	}
-	if in.ExtraPerMonthMilliunits == 0 && totalMinimumsMu <= totalInterestMu {
+	// Negative amortization: if total payment capacity (minimums + any
+	// extra) is not enough to cover aggregate monthly interest, the debt
+	// cannot decrease. Raise a structured error — clearer than the
+	// generic "did not converge" the simulation would emit later. The
+	// extra is included in the check so callers who provide insufficient
+	// extra still get the structured shortfall message instead of the
+	// generic simulation failure. Review finding H6.
+	if totalMinimumsMu+in.ExtraPerMonthMilliunits <= totalInterestMu {
 		return nil, YnabDebtSnapshotOutput{}, fmt.Errorf(
-			"negative_amortization: total minimum payments (%s) are less than or equal to total monthly interest (%s); "+
+			"negative_amortization: total payment capacity (minimums %s + extra %s) is less than or equal to total monthly interest (%s); "+
 				"shortfall %s milliunits. Payments must exceed interest for debt to decrease — "+
-				"either the APRs are wrong, minimums are wrong, or extra_per_month_milliunits must be provided",
+				"either the APRs are wrong, minimums are wrong, or extra_per_month_milliunits must be increased",
 			formatMilliunits(totalMinimumsMu),
+			formatMilliunits(in.ExtraPerMonthMilliunits),
 			formatMilliunits(totalInterestMu),
-			formatMilliunits(totalInterestMu-totalMinimumsMu+1),
+			formatMilliunits(totalInterestMu-totalMinimumsMu-in.ExtraPerMonthMilliunits+1),
 		)
 	}
 
@@ -641,7 +657,14 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 		return nil, YnabStatusOutput{}, err
 	}
 
+	// Each sub-call is preceded by a ctx.Err() gate so a mid-sequence
+	// cancellation (client hung up, per-request deadline fired) aborts
+	// the composition before assembling partial output. Review finding H5.
+
 	// 1. Current month for ready_to_assign.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabStatusOutput{}, err
+	}
 	_, monthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: "current"})
 	if err != nil {
 		return nil, YnabStatusOutput{}, sanitizedErr(err)
@@ -650,6 +673,9 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// 2. Accounts — for debt balances, savings_accounts, and
 	//    days_since_last_reconciled. Use list_accounts with include_closed
 	//    off (we only care about live accounts).
+	if err := ctx.Err(); err != nil {
+		return nil, YnabStatusOutput{}, err
+	}
 	_, accOut, err := c.ListAccounts(ctx, nil, ListAccountsInput{PlanID: in.PlanID, IncludeClosed: false})
 	if err != nil {
 		return nil, YnabStatusOutput{}, sanitizedErr(err)
@@ -657,6 +683,9 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 
 	// 3. Categories for overspent detection. list_categories already
 	//    includes group_name on each category.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabStatusOutput{}, err
+	}
 	_, catOut, err := c.ListCategories(ctx, nil, ListCategoriesInput{PlanID: in.PlanID})
 	if err != nil {
 		return nil, YnabStatusOutput{}, sanitizedErr(err)
@@ -667,6 +696,9 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// Transfers between on-budget accounts appear as two unapproved rows;
 	// count one side only (the outflow) so a single unapproved transfer
 	// counts as 1 pending item, not 2.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabStatusOutput{}, err
+	}
 	unapprovedRows, unapprovedTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
 		planID:  in.PlanID,
 		txnType: "unapproved",
@@ -677,6 +709,9 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	unapprovedCount := countUnapprovedExcludingTransferMirrors(unapprovedRows)
 
 	// 5. Scheduled transactions for next 7 days window.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabStatusOutput{}, err
+	}
 	_, schedOut, err := c.ListScheduledTransactions(ctx, nil, ListScheduledTransactionsInput{
 		PlanID: in.PlanID,
 	})
@@ -768,8 +803,15 @@ func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in Ynab
 	// For now, compute via a fresh list_accounts call that we re-parse
 	// via a direct doJSON path. Simpler: extend the Account output type
 	// to include last_reconciled_at (done in this commit).
+	// Reconciliation tracking applies to on-budget accounts only.
+	// Off-budget tracking accounts (investments, assets the user is
+	// merely monitoring) are not reconciled in the YNAB sense, so
+	// including them here produces noise. Review finding M7.
 	today := nowUTC()
 	for _, a := range accOut.Accounts {
+		if !a.OnBudget {
+			continue
+		}
 		entry := DaysSinceLastReconciledEntry{
 			AccountID: a.ID,
 			Name:      a.Name,
@@ -920,12 +962,20 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 			"(YNAB's API does not expose category balances at day granularity); all other fields are week-granular.",
 	}
 
+	// Each sub-call below is preceded by a ctx.Err() gate so a
+	// mid-sequence cancellation (client hung up, per-request deadline)
+	// aborts the composition before assembling partial output. Review
+	// finding H5.
+
 	// Fetch transactions from priorStart onward in a single call via the
 	// aggregation path so the 500-row LLM-context trim doesn't silently
 	// drop older transactions. This is critical: the prior week is
 	// "older" than this week, so a 500-row trim on the base list would
 	// evict the prior week first and leave every prior-period number
 	// wrong without any indication.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, err
+	}
 	txns, periodTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
 		planID:    in.PlanID,
 		sinceDate: priorStartStr,
@@ -985,6 +1035,9 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 	// path so we count the full set, not a 500-row trim. Transfers between
 	// on-budget accounts appear as two unapproved rows; count one side
 	// only (the outflow) to avoid double-counting.
+	if err := ctx.Err(); err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, err
+	}
 	unapprovedRows, unapprovedTruncated, err := c.fetchTransactionsForAggregation(ctx, txnFetchOpts{
 		planID:  in.PlanID,
 		txnType: "unapproved",
@@ -1006,12 +1059,23 @@ func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, 
 	currentMonthDate := asOf.Format("2006-01") + "-01"
 	priorMonthDate := asOf.AddDate(0, -1, 0).Format("2006-01") + "-01"
 
+	if err := ctx.Err(); err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, err
+	}
 	_, curMonthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: currentMonthDate})
 	if err != nil {
 		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, err
+	}
+	// Prior-month 404 is NOT fatal: a brand-new plan has no prior month
+	// yet, and refusing to run the check in that case would make the
+	// tool unusable on day 1. Treat 404 as empty prior month and
+	// continue; the month-over-month comparison simply reports every
+	// current-month overspend as "newly overspent". Review finding M5.
 	_, priorMonthOut, err := c.GetMonth(ctx, nil, GetMonthInput{PlanID: in.PlanID, Month: priorMonthDate})
-	if err != nil {
+	if err != nil && !isNotFound(err) {
 		return nil, YnabWeeklyCheckinOutput{}, sanitizedErr(err)
 	}
 	priorOverspentByID := make(map[string]bool)
@@ -1082,10 +1146,19 @@ type YnabSpendingCheckOutput struct {
 	BudgetMilliunits         int64         `json:"budget_milliunits"`
 	DeltaMilliunits          int64         `json:"delta_milliunits" jsonschema:"actual - budget. Positive = over budget, negative = under budget. May be unreliable when Truncated=true."`
 	TransactionCount         int           `json:"transaction_count"`
-	OffendingTransactions    []Transaction `json:"offending_transactions,omitempty" jsonschema:"populated only when actual > budget AND not truncated: the transactions that contributed to the overspend, sorted by amount descending (biggest contributors first)"`
+	OffendingTransactions    []Transaction `json:"offending_transactions,omitempty" jsonschema:"populated only when actual > budget AND not truncated: the top contributors sorted by amount descending. Capped at offending_transactions_capped_at entries to keep MCP payloads small."`
+	OffendingTransactionsCappedAt int      `json:"offending_transactions_capped_at,omitempty" jsonschema:"per-response cap applied to offending_transactions (present only when the cap was actually hit)"`
 	Truncated                bool          `json:"truncated,omitempty" jsonschema:"true when at least one category fetch exceeded the internal 50000-row safety ceiling. When true, OnPlan is absent and numeric fields are lower bounds."`
 	VerdictUnavailableReason string        `json:"verdict_unavailable_reason,omitempty" jsonschema:"populated only when Truncated=true; explains why on_plan cannot be given"`
 }
+
+// maxOffendingTransactions caps the number of over-budget transactions
+// serialized into the YnabSpendingCheck response. At ~300 bytes per
+// Transaction entry this keeps the worst-case MCP payload under ~15 KB
+// per call — enough for "these are the trips that put you over" while
+// preventing a 50K-row ceiling hit from producing a ~15 MB response.
+// Review finding M6.
+const maxOffendingTransactions = 50
 
 // YnabSpendingCheck aggregates spending across one or more categories
 // over a date range and compares to a budget. Returns an on_plan boolean
@@ -1110,6 +1183,18 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 	if len(in.CategoryIDs) == 0 {
 		return nil, YnabSpendingCheckOutput{}, errors.New("category_ids must contain at least one category")
 	}
+	// Cap the number of categories to keep worst-case latency bounded.
+	// YnabSpendingCheck issues one sequential HTTP call per category
+	// (YNAB has no batch endpoint) and each call consumes a rate-limit
+	// token, so a 50-category call could block for minutes. 20 is a
+	// generous ceiling for realistic "did I stay on my food budget?"
+	// use cases while preventing pathological inputs. Review finding M4.
+	const maxCategoryIDs = 20
+	if len(in.CategoryIDs) > maxCategoryIDs {
+		return nil, YnabSpendingCheckOutput{}, fmt.Errorf(
+			"category_ids has %d entries; the tool caps at %d to keep latency bounded — split the check into smaller calls",
+			len(in.CategoryIDs), maxCategoryIDs)
+	}
 	if in.StartDate == "" || in.EndDate == "" {
 		return nil, YnabSpendingCheckOutput{}, errors.New("start_date and end_date are required (YYYY-MM-DD)")
 	}
@@ -1126,8 +1211,15 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, YnabSpendingCheckOutput{}, errors.New("budget_milliunits must be non-negative")
 	}
 
+	// Build the excluded-payee set. Skip empty strings: payeeIDForTransaction
+	// returns "" for rows without a payee_id (subtransactions, starting
+	// balances, etc.), and a literal "" in the exclusion set would
+	// silently drop all of them. Review finding M3.
 	excluded := make(map[string]struct{}, len(in.ExcludedPayeeIDs))
 	for _, id := range in.ExcludedPayeeIDs {
+		if id == "" {
+			continue
+		}
 		excluded[id] = struct{}{}
 	}
 
@@ -1227,6 +1319,14 @@ func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, 
 				}
 				return ai > aj
 			})
+			// Cap the offending transaction list (review finding M6).
+			// The sorted-by-absolute-amount-descending order guarantees
+			// that the top-N kept entries are the ones that contributed
+			// most to the overspend.
+			if len(txns) > maxOffendingTransactions {
+				txns = txns[:maxOffendingTransactions]
+				out.OffendingTransactionsCappedAt = maxOffendingTransactions
+			}
 			out.OffendingTransactions = txns
 		}
 	}
@@ -1312,6 +1412,12 @@ type YnabWaterfallAssignmentOutput struct {
 	ProposedAllocations  []WaterfallAllocation  `json:"proposed_allocations"`
 	TierSummary          []WaterfallTierSummary `json:"tier_summary"`
 	Remainder            Money                  `json:"remainder" jsonschema:"amount left over after the waterfall completed; the skill decides whether to park it in Ready-to-Assign or on a further tier"`
+	// Warnings surfaces non-fatal issues the caller should see — e.g.
+	// category_ids that were not present in the month snapshot (hidden,
+	// deleted, renamed, or typo). Such categories are skipped entirely
+	// (no allocation, no need counted) so they cannot cause an update
+	// that zeros out an existing budgeted value. Review nit.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // YnabWaterfallAssignment walks the waterfall and returns proposed
@@ -1367,19 +1473,30 @@ func (c *Client) YnabWaterfallAssignment(ctx context.Context, _ *mcp.CallToolReq
 	remaining := in.IncomingAmountMilliunits
 	allocations := make([]WaterfallAllocation, 0)
 	tierSummaries := make([]WaterfallTierSummary, 0, len(in.PriorityTiers))
+	var warnings []string
 
 	stopAllocatingRemainingTiers := false
 	for _, tier := range in.PriorityTiers {
 		var tierNeeded, tierAllocated int64
 		for _, cat := range tier.Categories {
+			current, known := byID[cat.CategoryID]
+			if !known {
+				// Unknown category_id: skip entirely rather than
+				// emitting a WaterfallAllocation whose NewBudgeted ==
+				// alloc (which would overwrite an existing budgeted
+				// value with just the increment on downstream
+				// update_category_budgeted). Emit a warning so the
+				// skill can surface the typo/hidden-category. Review
+				// nit.
+				warnings = append(warnings, fmt.Sprintf(
+					"tier %q: category_id %q not present in month snapshot (hidden, deleted, or typo) — skipped entirely; no allocation recorded",
+					tier.Name, cat.CategoryID))
+				continue
+			}
 			tierNeeded += cat.NeedMilliunits
 			if stopAllocatingRemainingTiers {
 				// Subsequent tiers get a record with zero allocation so
 				// the LLM can see what was skipped, but no money is moved.
-				current, ok := byID[cat.CategoryID]
-				if !ok {
-					current = Category{ID: cat.CategoryID}
-				}
 				allocations = append(allocations, WaterfallAllocation{
 					TierName:             tier.Name,
 					CategoryID:           cat.CategoryID,
@@ -1401,13 +1518,6 @@ func (c *Client) YnabWaterfallAssignment(ctx context.Context, _ *mcp.CallToolReq
 			tierAllocated += alloc
 			remaining -= alloc
 
-			current, ok := byID[cat.CategoryID]
-			if !ok {
-				// Category not found in current month. Still record the
-				// allocation with zero current values; the skill should
-				// log the mismatch.
-				current = Category{ID: cat.CategoryID}
-			}
 			newBudgetedMu := current.Budgeted.Milliunits + alloc
 			allocations = append(allocations, WaterfallAllocation{
 				TierName:             tier.Name,
@@ -1437,5 +1547,6 @@ func (c *Client) YnabWaterfallAssignment(ctx context.Context, _ *mcp.CallToolReq
 		ProposedAllocations: allocations,
 		TierSummary:         tierSummaries,
 		Remainder:           NewMoney(remaining),
+		Warnings:            warnings,
 	}, nil
 }

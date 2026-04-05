@@ -2,7 +2,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,26 +73,41 @@ func sanitize(s string) string {
 // envelope, it still returns a status-only error.
 func apiError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-	// Strict decode of the error envelope. If YNAB ever renames a field
-	// or adds one, DisallowUnknownFields causes this decode to fail and
-	// we fall through to the status-only error path — loud failure is
-	// preferred for schema drift on this small fixed envelope. Review
-	// finding M12 (narrow application: only the error schema, not
-	// response data which legitimately has many fields we don't model).
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
+	// Lenient decode — YNAB may add fields to its error envelope in the
+	// future, and we do NOT want schema drift to degrade a
+	// "validation_error" into an opaque "http 422" (the LLM relies on
+	// the name field for self-correction). Strict decoding was tried in
+	// an earlier pass and reverted per review finding M2.
 	var parsed ynabErrorBody
-	if err := dec.Decode(&parsed); err == nil && parsed.Error.Name != "" {
-		return errors.New(sanitize(fmt.Sprintf(
-			"ynab: http %d: %s",
-			resp.StatusCode,
-			parsed.Error.Name,
-		)))
+	parseErr := json.Unmarshal(body, &parsed)
+	var nameSuffix string
+	if parseErr == nil && parsed.Error.Name != "" {
+		nameSuffix = ": " + parsed.Error.Name
 	}
-	return fmt.Errorf("ynab: http %d", resp.StatusCode)
+	msg := sanitize(fmt.Sprintf("ynab: http %d%s", resp.StatusCode, nameSuffix))
+	// Wrap the 404 sentinel so composition tools can branch on it via
+	// errors.Is without string matching. All other statuses return a
+	// plain error.
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%s: %w", msg, errYNABNotFound)
+	}
+	return errors.New(msg)
 }
 
 // errHostLocked is returned by the host-locked RoundTripper when a request is
 // attempted against a host other than api.ynab.com. Sentinel so tests can
 // match exactly.
 var errHostLocked = errors.New("ynab: request blocked: non-YNAB host")
+
+// errYNABNotFound is returned by apiError when YNAB responds with HTTP 404.
+// Exposed as a sentinel so composition tools (YnabWeeklyCheckin, etc.)
+// can distinguish "no prior month exists yet" (harmless) from any other
+// upstream failure. Review finding M5.
+var errYNABNotFound = errors.New("ynab: http 404")
+
+// isNotFound reports whether err (or any wrapped error in its chain)
+// represents a YNAB 404. Uses errors.Is so the sentinel survives
+// sanitizedErr wrapping.
+func isNotFound(err error) bool {
+	return errors.Is(err, errYNABNotFound)
+}

@@ -34,7 +34,10 @@ jobs:
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a  # v6.4.0
         with:
           distribution: goreleaser
-          version: latest
+          # Pin the GoReleaser binary to an explicit v2.x version
+          # instead of "latest" so a release run cannot silently adopt
+          # a new major line. Review finding H7.
+          version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

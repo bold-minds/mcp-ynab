@@ -18,7 +18,10 @@
 
 package main
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+)
 
 // Money represents a currency amount with milliunit precision. The JSON
 // output is an object with both the int64 authoritative value and a
@@ -58,9 +61,11 @@ func formatMilliunits(m int64) string {
 	if negative {
 		// Handle math.MinInt64 carefully: negating it overflows. In
 		// practice YNAB amounts never come near this, but we do not want
-		// to panic. Fall through with the negative sign prepended and
-		// work with the absolute value of the un-negated int via uint64.
-		if m == -9223372036854775808 { // math.MinInt64
+		// to panic. Return the pre-computed decimal form directly for
+		// this boundary and fall through with the negative sign prepended
+		// otherwise. Review nit: named stdlib const in place of the
+		// literal.
+		if m == math.MinInt64 {
 			return "-9223372036854775.808"
 		}
 		m = -m

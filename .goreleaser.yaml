@@ -41,6 +41,17 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+# Generate a CycloneDX SBOM per release archive so downstream consumers
+# can audit transitive dependencies without re-running `go list`. Supply
+# chain is in-scope per SECURITY.md. Review finding M14. Requires
+# syft to be available in the runner image; GoReleaser invokes it via
+# its default `sbom` integration.
+sboms:
+  - id: archive
+    artifacts: archive
+    documents:
+      - "${artifact}.sbom.json"
+
 dockers:
   - image_templates:
       - "ghcr.io/bold-minds/mcp-ynab:{{ .Version }}-amd64"
