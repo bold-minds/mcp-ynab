@@ -81,7 +81,6 @@ func TestCheckAmountBound_UnderThreshold(t *testing.T) {
 		{"negative at threshold", -amountBoundMilliunits, 0},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			if err := checkAmountBound(c.amount, c.override); err != nil {
@@ -104,7 +103,6 @@ func TestCheckAmountBound_OverThresholdRejectedWithoutOverride(t *testing.T) {
 		{"large negative", -100_000_000},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			err := checkAmountBound(c.amount, 0) // zero-value override

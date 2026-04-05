@@ -68,6 +68,10 @@ type CreateTransactionInput struct {
 	AmountOverrideMilliunits int64 `json:"amount_override_milliunits,omitempty" jsonschema:"if |amount_milliunits| exceeds the $10K safety threshold, set this to the same value as amount_milliunits to acknowledge the large transaction"`
 }
 
+// CreateTransactionOutput is the response shape for create_transaction.
+// Before is always null for a create (no prior state); After carries the
+// account balance snapshot after the insert so the skill can render a
+// diff and persist an audit entry.
 type CreateTransactionOutput struct {
 	Transaction Transaction `json:"transaction"`
 	// Before is always null for create_transaction — there is no prior
@@ -97,10 +101,13 @@ type UpdateCategoryBudgetedInput struct {
 	AmountOverrideMilliunits int64 `json:"amount_override_milliunits,omitempty" jsonschema:"if |new_budgeted_milliunits| exceeds the $10K safety threshold, set this to the same value to acknowledge"`
 }
 
+// UpdateCategoryBudgetedOutput returns the post-update category plus
+// before/after CategorySnapshot values so the caller can compute the
+// exact delta applied to Rule 3 money moves.
 type UpdateCategoryBudgetedOutput struct {
-	Category Category          `json:"category"`
-	Before   CategorySnapshot  `json:"before"`
-	After    CategorySnapshot  `json:"after"`
+	Category Category         `json:"category"`
+	Before   CategorySnapshot `json:"before"`
+	After    CategorySnapshot `json:"after"`
 }
 
 // CategorySnapshot is a lean before/after view of the two fields that matter

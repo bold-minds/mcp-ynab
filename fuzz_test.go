@@ -70,6 +70,19 @@ func FuzzSanitize(f *testing.F) {
 		if bearerRe.MatchString(s) && bearerRe.MatchString(out) {
 			t.Fatalf("sanitize failed to strip bearer pattern: in=%q out=%q", s, out)
 		}
+		// Stronger invariant: sanitize must NEVER introduce a bearer
+		// pattern that was not already in the input. A buggy
+		// replacement (e.g. a future refactor that builds the
+		// substitution string via fmt) could splice "Bearer " into a
+		// previously-clean message. The symmetric check catches that
+		// class of regression. Review nit on FuzzSanitize bearer
+		// introduction.
+		if !bearerRe.MatchString(s) && bearerRe.MatchString(out) {
+			t.Fatalf("sanitize introduced a bearer pattern: in=%q out=%q", s, out)
+		}
+		if !authHeaderRe.MatchString(s) && authHeaderRe.MatchString(out) {
+			t.Fatalf("sanitize introduced an Authorization-header pattern: in=%q out=%q", s, out)
+		}
 	})
 }
 

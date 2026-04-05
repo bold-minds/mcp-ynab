@@ -3,9 +3,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -118,6 +120,37 @@ func TestToken_RedactsViaLog(t *testing.T) {
 	out := buf.String()
 	if strings.Contains(out, leakSentinel) {
 		t.Errorf("REDACTION FAILURE via log: %q", out)
+	}
+}
+
+// TestToken_RedactsViaSlog guards against a future contributor switching
+// the codebase from log.Printf to log/slog and discovering that slog's
+// default %v handler would emit the raw token. Token's fmt.Formatter
+// and fmt.Stringer impls short-circuit both text and JSON slog handlers;
+// this test locks that behavior in. Review nit on missing slog redaction
+// test.
+func TestToken_RedactsViaSlog(t *testing.T) {
+	t.Parallel()
+	tok := NewToken(leakSentinel)
+
+	var textBuf bytes.Buffer
+	textLogger := slog.New(slog.NewTextHandler(&textBuf, nil))
+	textLogger.LogAttrs(context.Background(), slog.LevelInfo, "dump",
+		slog.Any("token", tok),
+		slog.Any("wrapped", struct{ Token Token }{Token: tok}),
+	)
+	if strings.Contains(textBuf.String(), leakSentinel) {
+		t.Errorf("REDACTION FAILURE via slog text handler: %q", textBuf.String())
+	}
+
+	var jsonBuf bytes.Buffer
+	jsonLogger := slog.New(slog.NewJSONHandler(&jsonBuf, nil))
+	jsonLogger.LogAttrs(context.Background(), slog.LevelInfo, "dump",
+		slog.Any("token", tok),
+		slog.Any("wrapped", struct{ Token Token }{Token: tok}),
+	)
+	if strings.Contains(jsonBuf.String(), leakSentinel) {
+		t.Errorf("REDACTION FAILURE via slog JSON handler: %q", jsonBuf.String())
 	}
 }
 

@@ -29,9 +29,25 @@ import (
 // invocation instead of 3–4. Review finding L11.
 var (
 	cachedBinary     string
+	cachedBinaryDir  string
 	cachedBinaryErr  error
 	cachedBinaryOnce sync.Once
 )
+
+// TestMain cleans up the cached binary's temp directory after all tests
+// in the package have finished. The buildTestBinary helper cannot use
+// t.TempDir() because that scopes the directory to a single test, but
+// the binary is shared across every subprocess test — so the directory
+// has to outlive individual tests and still be cleaned up eventually.
+// Before this hook was added, every `go test` run leaked a
+// /tmp/mcp-ynab-test-binary-* directory. Review nit on leaked temp dirs.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if cachedBinaryDir != "" {
+		_ = os.RemoveAll(cachedBinaryDir)
+	}
+	os.Exit(code)
+}
 
 // buildTestBinary compiles mcp-ynab to a temp path and returns the path.
 // The compile result is cached across subtests via cachedBinaryOnce so the
@@ -46,6 +62,7 @@ func buildTestBinary(t *testing.T) string {
 			cachedBinaryErr = err
 			return
 		}
+		cachedBinaryDir = dir // TestMain removes this after all tests run
 		bin := filepath.Join(dir, "mcp-ynab-test")
 		cmd := exec.Command("go", "build", "-o", bin, ".")
 		cmd.Env = append(cmd.Environ(), "CGO_ENABLED=0")

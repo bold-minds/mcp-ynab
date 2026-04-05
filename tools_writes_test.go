@@ -155,8 +155,11 @@ func TestCreateTransaction_RequiresPayee(t *testing.T) {
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
 		PlanID: "p", AccountID: "a", AmountMilliunits: 100,
 	})
-	if err == nil || !strings.Contains(err.Error(), "payee") {
-		t.Errorf("expected payee error, got %v", err)
+	// Assert the full error phrasing, not a weak "payee" substring that
+	// would pass on any unrelated error mentioning "payee". Review nit on
+	// weak strings.Contains assertions.
+	if err == nil || !strings.Contains(err.Error(), "one of payee_name or payee_id is required") {
+		t.Errorf("expected missing-payee error, got %v", err)
 	}
 }
 
@@ -185,7 +188,7 @@ func TestCreateTransaction_MemoLengthLimit(t *testing.T) {
 		PlanID: "p", AccountID: "a", AmountMilliunits: 100, PayeeName: "X",
 		Memo: strings.Repeat("a", 201),
 	})
-	if err == nil || !strings.Contains(err.Error(), "200") {
+	if err == nil || !strings.Contains(err.Error(), "memo must be at most 200 characters") {
 		t.Errorf("expected memo length error, got %v", err)
 	}
 }
@@ -258,7 +261,7 @@ func TestCreateTransaction_PayeeIDAndNameMutuallyExclusive(t *testing.T) {
 		PlanID: "p", AccountID: "a", AmountMilliunits: -100,
 		PayeeID: "some-id", PayeeName: "Chipotle",
 	})
-	if err == nil || !strings.Contains(err.Error(), "payee") {
+	if err == nil || !strings.Contains(err.Error(), "at most one of payee_id or payee_name may be set") {
 		t.Errorf("expected mutex error, got %v", err)
 	}
 }

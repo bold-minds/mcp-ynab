@@ -97,7 +97,6 @@ func TestHostLockedTransport_AllowsCaseInsensitiveAndPort(t *testing.T) {
 		{"attacker path trick", "https://evil.example/api.ynab.com/plans", false},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			inner := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
