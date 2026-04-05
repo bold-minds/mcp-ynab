@@ -67,9 +67,9 @@ func TestDebtSnapshot_RequiresPlanID(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		DebtAccountConfig: []DebtAccountConfig{{AccountID: "a", APRPercent: 20, MinimumPaymentMilliunits: 100000}},
+		DebtAccountConfig: []DebtAccountConfig{{AccountID: testAccountID, APRPercent: 20, MinimumPaymentMilliunits: 100000}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+	if err == nil || !strings.Contains(err.Error(), "plan_id: invalid identifier") {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -79,7 +79,7 @@ func TestDebtSnapshot_RequiresAtLeastOneAccount(t *testing.T) {
 	client, _ := testClient(t, func(_ http.ResponseWriter, _ *http.Request) {
 		t.Error("server should not be called")
 	})
-	_, _, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{PlanID: "p"})
+	_, _, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{PlanID: testPlanID})
 	if err == nil || !strings.Contains(err.Error(), "at least one account") {
 		t.Errorf("wrong error: %v", err)
 	}
@@ -100,9 +100,9 @@ func TestDebtSnapshot_APRValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		_, _, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-			PlanID: "p",
+			PlanID: testPlanID,
 			DebtAccountConfig: []DebtAccountConfig{
-				{AccountID: "a", APRPercent: c.apr, MinimumPaymentMilliunits: 100000},
+				{AccountID: testAccountID, APRPercent: c.apr, MinimumPaymentMilliunits: 100000},
 			},
 		})
 		if err == nil || !strings.Contains(err.Error(), c.want) {
@@ -122,12 +122,12 @@ func TestDebtSnapshot_ZeroAPR_ExactPayoff(t *testing.T) {
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a1", Name: "Card", OwedMu: 1_000_000},
+		}{ID: testAccountID, Name: "Card", OwedMu: 1_000_000},
 	))
 	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a1", APRPercent: 0, MinimumPaymentMilliunits: 100_000},
+			{AccountID: testAccountID, APRPercent: 0, MinimumPaymentMilliunits: 100_000},
 		},
 	})
 	if err != nil {
@@ -156,12 +156,12 @@ func TestDebtSnapshot_WithExtra_FasterPayoff(t *testing.T) {
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a1", Name: "Card", OwedMu: 1_000_000},
+		}{ID: testAccountID, Name: "Card", OwedMu: 1_000_000},
 	))
 	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a1", APRPercent: 0, MinimumPaymentMilliunits: 100_000},
+			{AccountID: testAccountID, APRPercent: 0, MinimumPaymentMilliunits: 100_000},
 		},
 		ExtraPerMonthMilliunits: 100_000,
 	})
@@ -199,19 +199,19 @@ func TestDebtSnapshot_Avalanche_HighAPRFirst(t *testing.T) {
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a", Name: "High APR", OwedMu: 500_000},
+		}{ID: testAccountID, Name: "High APR", OwedMu: 500_000},
 		struct {
 			ID     string
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "b", Name: "Low APR", OwedMu: 500_000},
+		}{ID: testAccountIDAlt, Name: "Low APR", OwedMu: 500_000},
 	))
 	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a", Nickname: "High", APRPercent: 20, MinimumPaymentMilliunits: 50_000},
-			{AccountID: "b", Nickname: "Low", APRPercent: 5, MinimumPaymentMilliunits: 50_000},
+			{AccountID: testAccountID, Nickname: "High", APRPercent: 20, MinimumPaymentMilliunits: 50_000},
+			{AccountID: testAccountIDAlt, Nickname: "Low", APRPercent: 5, MinimumPaymentMilliunits: 50_000},
 		},
 		ExtraPerMonthMilliunits: 200_000,
 	})
@@ -225,10 +225,10 @@ func TestDebtSnapshot_Avalanche_HighAPRFirst(t *testing.T) {
 	if len(payoff) != 2 {
 		t.Fatalf("expected 2 payoff milestones, got %d", len(payoff))
 	}
-	if payoff[0].AccountID != "a" {
+	if payoff[0].AccountID != testAccountID {
 		t.Errorf("high APR card should be paid off first, got %s", payoff[0].AccountID)
 	}
-	if payoff[1].AccountID != "b" {
+	if payoff[1].AccountID != testAccountIDAlt {
 		t.Errorf("low APR card should be paid off second, got %s", payoff[1].AccountID)
 	}
 	if payoff[0].MonthPaidOff >= payoff[1].MonthPaidOff {
@@ -249,12 +249,12 @@ func TestDebtSnapshot_AggregateNegativeAmortizationError(t *testing.T) {
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a", Name: "Card", OwedMu: 10_000_000},
+		}{ID: testAccountID, Name: "Card", OwedMu: 10_000_000},
 	))
 	_, _, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a", APRPercent: 24, MinimumPaymentMilliunits: 100_000},
+			{AccountID: testAccountID, APRPercent: 24, MinimumPaymentMilliunits: 100_000},
 		},
 	})
 	if err == nil {
@@ -284,19 +284,19 @@ func TestDebtSnapshot_PerAccountWarningButSimulationConverges(t *testing.T) {
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a", Name: "Small Growing Card", OwedMu: 50_000},
+		}{ID: testAccountID, Name: "Small Growing Card", OwedMu: 50_000},
 		struct {
 			ID     string
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "b", Name: "Big Paying Card", OwedMu: 100_000},
+		}{ID: testAccountIDAlt, Name: "Big Paying Card", OwedMu: 100_000},
 	))
 	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a", APRPercent: 30, MinimumPaymentMilliunits: 1_000},
-			{AccountID: "b", APRPercent: 5, MinimumPaymentMilliunits: 200_000},
+			{AccountID: testAccountID, APRPercent: 30, MinimumPaymentMilliunits: 1_000},
+			{AccountID: testAccountIDAlt, APRPercent: 5, MinimumPaymentMilliunits: 200_000},
 		},
 	})
 	if err != nil {
@@ -307,12 +307,12 @@ func TestDebtSnapshot_PerAccountWarningButSimulationConverges(t *testing.T) {
 	}
 	var cardAWarning *DebtSnapshotWarning
 	for i := range out.Warnings {
-		if out.Warnings[i].AccountID == "a" {
+		if out.Warnings[i].AccountID == testAccountID {
 			cardAWarning = &out.Warnings[i]
 		}
 	}
 	if cardAWarning == nil {
-		t.Error("expected warning for account 'a'")
+		t.Error("expected warning for testAccountID")
 	} else if cardAWarning.ShortfallMilliunits <= 0 {
 		t.Errorf("shortfall should be positive, got %d", cardAWarning.ShortfallMilliunits)
 	}
@@ -334,12 +334,12 @@ func TestDebtSnapshot_AllZeroBalancesYieldsZeroMonths(t *testing.T) {
 			Name   string
 			OwedMu int64
 			Type   string
-		}{ID: "a", Name: "Paid-off Card", OwedMu: 0},
+		}{ID: testAccountID, Name: "Paid-off Card", OwedMu: 0},
 	))
 	_, out, err := client.YnabDebtSnapshot(context.Background(), nil, YnabDebtSnapshotInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "a", APRPercent: 20, MinimumPaymentMilliunits: 10_000},
+			{AccountID: testAccountID, APRPercent: 20, MinimumPaymentMilliunits: 10_000},
 		},
 	})
 	if err != nil {
@@ -407,8 +407,8 @@ func TestSpendingCheck_UnderBudget(t *testing.T) {
 		{"id":"t2","type":"transaction","date":"2026-04-05","amount":-100000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p2","payee_name":"Target","category_name":"Groceries","deleted":false}
 	]}}`))
 	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
-		PlanID:           "p",
-		CategoryIDs:      []string{"cat-groceries"},
+		PlanID:           testPlanID,
+		CategoryIDs:      []string{testCategoryID},
 		StartDate:        "2026-04-01",
 		EndDate:          "2026-04-07",
 		BudgetMilliunits: 300_000,
@@ -444,8 +444,8 @@ func TestSpendingCheck_OverBudgetIncludesOffendingSortedBySize(t *testing.T) {
 		{"id":"medium","type":"transaction","date":"2026-04-06","amount":-80000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false}
 	]}}`))
 	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
-		PlanID:           "p",
-		CategoryIDs:      []string{"cat"},
+		PlanID:           testPlanID,
+		CategoryIDs:      []string{testCategoryID},
 		StartDate:        "2026-04-01",
 		EndDate:          "2026-04-07",
 		BudgetMilliunits: 300_000, // $300 budget, $360 spent → $60 over
@@ -482,8 +482,8 @@ func TestSpendingCheck_RefundsOffsetSpending(t *testing.T) {
 		{"id":"refund","type":"transaction","date":"2026-04-05","amount":30000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Shopping","deleted":false}
 	]}}`))
 	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
-		PlanID:           "p",
-		CategoryIDs:      []string{"cat"},
+		PlanID:           testPlanID,
+		CategoryIDs:      []string{testCategoryID},
 		StartDate:        "2026-04-01",
 		EndDate:          "2026-04-30",
 		BudgetMilliunits: 100_000,
@@ -499,17 +499,19 @@ func TestSpendingCheck_RefundsOffsetSpending(t *testing.T) {
 func TestSpendingCheck_ExcludedPayeeFiltering(t *testing.T) {
 	t.Parallel()
 	// Two transactions, one from excluded payee — should be dropped from total.
-	client, _ := testClient(t, categoryTxnHandler(`{"data":{"server_knowledge":1,"transactions":[
-		{"id":"regular","type":"transaction","date":"2026-04-03","amount":-50000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p-wholefoods","payee_name":"Whole Foods","category_name":"Groceries","deleted":false},
-		{"id":"datenight","type":"transaction","date":"2026-04-06","amount":-40000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":"p-chipotle","payee_name":"Chipotle","category_name":"Groceries","deleted":false}
-	]}}`))
+	// Wire the excluded Chipotle payee's id to match testPayeeIDAlt so
+	// the input validator accepts it as a canonical UUID.
+	client, _ := testClient(t, categoryTxnHandler(fmt.Sprintf(`{"data":{"server_knowledge":1,"transactions":[
+		{"id":"regular","type":"transaction","date":"2026-04-03","amount":-50000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":%q,"payee_name":"Whole Foods","category_name":"Groceries","deleted":false},
+		{"id":"datenight","type":"transaction","date":"2026-04-06","amount":-40000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","payee_id":%q,"payee_name":"Chipotle","category_name":"Groceries","deleted":false}
+	]}}`, testPayeeID, testPayeeIDAlt)))
 	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
-		PlanID:           "p",
-		CategoryIDs:      []string{"cat"},
+		PlanID:           testPlanID,
+		CategoryIDs:      []string{testCategoryID},
 		StartDate:        "2026-04-01",
 		EndDate:          "2026-04-30",
 		BudgetMilliunits: 100_000,
-		ExcludedPayeeIDs: []string{"p-chipotle"},
+		ExcludedPayeeIDs: []string{testPayeeIDAlt},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -531,8 +533,8 @@ func TestSpendingCheck_DateRangeRespectsEndDate(t *testing.T) {
 		{"id":"outside","type":"transaction","date":"2026-04-30","amount":-100000,"cleared":"cleared","approved":true,"account_id":"a","account_name":"Checking","category_name":"Groceries","deleted":false}
 	]}}`))
 	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
-		PlanID:           "p",
-		CategoryIDs:      []string{"cat"},
+		PlanID:           testPlanID,
+		CategoryIDs:      []string{testCategoryID},
 		StartDate:        "2026-04-01",
 		EndDate:          "2026-04-07",
 		BudgetMilliunits: 1_000_000,
@@ -555,12 +557,12 @@ func TestSpendingCheck_InputValidation(t *testing.T) {
 		in   YnabSpendingCheckInput
 		want string
 	}{
-		{"no plan", YnabSpendingCheckInput{CategoryIDs: []string{"c"}, StartDate: "2026-04-01", EndDate: "2026-04-07"}, "plan_id"},
-		{"no categories", YnabSpendingCheckInput{PlanID: "p", StartDate: "2026-04-01", EndDate: "2026-04-07"}, "category_ids"},
-		{"no start", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, EndDate: "2026-04-07"}, "start_date"},
-		{"bad date", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, StartDate: "April 1", EndDate: "2026-04-07"}, "YYYY-MM-DD"},
-		{"inverted range", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, StartDate: "2026-04-15", EndDate: "2026-04-01"}, "on or after"},
-		{"negative budget", YnabSpendingCheckInput{PlanID: "p", CategoryIDs: []string{"c"}, StartDate: "2026-04-01", EndDate: "2026-04-07", BudgetMilliunits: -1}, "non-negative"},
+		{"no plan", YnabSpendingCheckInput{CategoryIDs: []string{testCategoryID}, StartDate: "2026-04-01", EndDate: "2026-04-07"}, "plan_id"},
+		{"no categories", YnabSpendingCheckInput{PlanID: testPlanID, StartDate: "2026-04-01", EndDate: "2026-04-07"}, "category_ids"},
+		{"no start", YnabSpendingCheckInput{PlanID: testPlanID, CategoryIDs: []string{testCategoryID}, EndDate: "2026-04-07"}, "start_date"},
+		{"bad date", YnabSpendingCheckInput{PlanID: testPlanID, CategoryIDs: []string{testCategoryID}, StartDate: "April 1", EndDate: "2026-04-07"}, "YYYY-MM-DD"},
+		{"inverted range", YnabSpendingCheckInput{PlanID: testPlanID, CategoryIDs: []string{testCategoryID}, StartDate: "2026-04-15", EndDate: "2026-04-01"}, "on or after"},
+		{"negative budget", YnabSpendingCheckInput{PlanID: testPlanID, CategoryIDs: []string{testCategoryID}, StartDate: "2026-04-01", EndDate: "2026-04-07", BudgetMilliunits: -1}, "non-negative"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -596,8 +598,8 @@ func TestSpendingCheck_AggregationExceeds500RowLimit(t *testing.T) {
 
 	client, _ := testClient(t, categoryTxnHandler(body))
 	_, out, err := client.YnabSpendingCheck(context.Background(), nil, YnabSpendingCheckInput{
-		PlanID:           "p",
-		CategoryIDs:      []string{"cat"},
+		PlanID:           testPlanID,
+		CategoryIDs:      []string{testCategoryID},
 		StartDate:        "2026-04-01",
 		EndDate:          "2026-04-30",
 		BudgetMilliunits: 10_000_000, // $10K budget, way under the $600 total
@@ -631,14 +633,19 @@ func waterfallMonthHandler() http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"month":{
+		// Built via fmt.Sprintf so the embedded YNAB ids match the
+		// test-scoped UUID constants the Waterfall inputs use. Prior
+		// to the UUID-validation wiring these were short strings like
+		// "cat-rent"; the validator now requires canonical UUIDs, so
+		// the JSON body has to carry the same UUIDs the inputs do.
+		_, _ = fmt.Fprintf(w, `{"data":{"month":{
 			"month":"2026-04-01","income":5000000,"budgeted":2500000,"activity":-800000,"to_be_budgeted":1500000,
 			"categories":[
-				{"id":"cat-rent","category_group_id":"g1","category_group_name":"Immediate","name":"Rent","budgeted":1500000,"activity":0,"balance":1500000,"deleted":false},
-				{"id":"cat-groc","category_group_id":"g1","category_group_name":"Immediate","name":"Groceries","budgeted":400000,"activity":-100000,"balance":300000,"deleted":false},
-				{"id":"cat-vac","category_group_id":"g2","category_group_name":"True Expenses","name":"Vacation","budgeted":600000,"activity":0,"balance":600000,"deleted":false}
+				{"id":%q,"category_group_id":"g1","category_group_name":"Immediate","name":"Rent","budgeted":1500000,"activity":0,"balance":1500000,"deleted":false},
+				{"id":%q,"category_group_id":"g1","category_group_name":"Immediate","name":"Groceries","budgeted":400000,"activity":-100000,"balance":300000,"deleted":false},
+				{"id":%q,"category_group_id":"g2","category_group_name":"True Expenses","name":"Vacation","budgeted":600000,"activity":0,"balance":600000,"deleted":false}
 			]
-		}}}`))
+		}}}`, testCategoryID, testCategoryIDAlt, testCategoryIDAlt2)
 	}
 }
 
@@ -648,20 +655,20 @@ func TestWaterfall_FullyFundsAllTiersInOrder(t *testing.T) {
 	// Both fully funded; remainder = $2M.
 	client, _ := testClient(t, waterfallMonthHandler())
 	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
-		PlanID:                   "p",
+		PlanID:                   testPlanID,
 		IncomingAmountMilliunits: 10_000_000,
 		PriorityTiers: []WaterfallTier{
 			{
 				Name: "Immediate Obligations",
 				Categories: []WaterfallCategory{
-					{CategoryID: "cat-rent", NeedMilliunits: 3_000_000},
-					{CategoryID: "cat-groc", NeedMilliunits: 2_000_000},
+					{CategoryID: testCategoryID, NeedMilliunits: 3_000_000},
+					{CategoryID: testCategoryIDAlt, NeedMilliunits: 2_000_000},
 				},
 			},
 			{
 				Name: "True Expenses",
 				Categories: []WaterfallCategory{
-					{CategoryID: "cat-vac", NeedMilliunits: 3_000_000},
+					{CategoryID: testCategoryIDAlt2, NeedMilliunits: 3_000_000},
 				},
 			},
 		},
@@ -678,7 +685,7 @@ func TestWaterfall_FullyFundsAllTiersInOrder(t *testing.T) {
 	}
 	for _, a := range out.ProposedAllocations {
 		switch a.CategoryID {
-		case "cat-rent":
+		case testCategoryID:
 			if a.AdditionalAssignment.Milliunits != 3_000_000 {
 				t.Errorf("rent should get $3M, got %d", a.AdditionalAssignment.Milliunits)
 			}
@@ -686,11 +693,11 @@ func TestWaterfall_FullyFundsAllTiersInOrder(t *testing.T) {
 			if a.NewBudgeted.Milliunits != 4_500_000 {
 				t.Errorf("rent new_budgeted should be $4.5M, got %d", a.NewBudgeted.Milliunits)
 			}
-		case "cat-groc":
+		case testCategoryIDAlt:
 			if a.AdditionalAssignment.Milliunits != 2_000_000 {
 				t.Errorf("groceries should get $2M, got %d", a.AdditionalAssignment.Milliunits)
 			}
-		case "cat-vac":
+		case testCategoryIDAlt2:
 			if a.AdditionalAssignment.Milliunits != 3_000_000 {
 				t.Errorf("vacation should get $3M, got %d", a.AdditionalAssignment.Milliunits)
 			}
@@ -710,20 +717,20 @@ func TestWaterfall_PartialFundRunsOut(t *testing.T) {
 	// stop_if_unfunded=false (default), so tier 2 gets what's left (nothing).
 	client, _ := testClient(t, waterfallMonthHandler())
 	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
-		PlanID:                   "p",
+		PlanID:                   testPlanID,
 		IncomingAmountMilliunits: 3_000_000,
 		PriorityTiers: []WaterfallTier{
 			{
 				Name: "Tier1",
 				Categories: []WaterfallCategory{
-					{CategoryID: "cat-rent", NeedMilliunits: 3_000_000}, // gets all $3M
-					{CategoryID: "cat-groc", NeedMilliunits: 2_000_000}, // gets $0 (exhausted)
+					{CategoryID: testCategoryID, NeedMilliunits: 3_000_000}, // gets all $3M
+					{CategoryID: testCategoryIDAlt, NeedMilliunits: 2_000_000}, // gets $0 (exhausted)
 				},
 			},
 			{
 				Name: "Tier2",
 				Categories: []WaterfallCategory{
-					{CategoryID: "cat-vac", NeedMilliunits: 1_000_000}, // gets $0
+					{CategoryID: testCategoryIDAlt2, NeedMilliunits: 1_000_000}, // gets $0
 				},
 			},
 		},
@@ -738,11 +745,11 @@ func TestWaterfall_PartialFundRunsOut(t *testing.T) {
 	var rent, groc, vac int64
 	for _, a := range out.ProposedAllocations {
 		switch a.CategoryID {
-		case "cat-rent":
+		case testCategoryID:
 			rent = a.AdditionalAssignment.Milliunits
-		case "cat-groc":
+		case testCategoryIDAlt:
 			groc = a.AdditionalAssignment.Milliunits
-		case "cat-vac":
+		case testCategoryIDAlt2:
 			vac = a.AdditionalAssignment.Milliunits
 		}
 	}
@@ -773,20 +780,20 @@ func TestWaterfall_StopIfUnfundedHaltsSubsequentTiers(t *testing.T) {
 	// Tier2 should NOT allocate even if we had funds left.
 	client, _ := testClient(t, waterfallMonthHandler())
 	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
-		PlanID:                   "p",
+		PlanID:                   testPlanID,
 		IncomingAmountMilliunits: 10_000_000, // plenty of funds
 		PriorityTiers: []WaterfallTier{
 			{
 				Name:           "Tier1",
 				StopIfUnfunded: true,
 				Categories: []WaterfallCategory{
-					{CategoryID: "cat-rent", NeedMilliunits: 100_000_000}, // impossible to fund fully
+					{CategoryID: testCategoryID, NeedMilliunits: 100_000_000}, // impossible to fund fully
 				},
 			},
 			{
 				Name: "Tier2",
 				Categories: []WaterfallCategory{
-					{CategoryID: "cat-vac", NeedMilliunits: 1_000_000},
+					{CategoryID: testCategoryIDAlt2, NeedMilliunits: 1_000_000},
 				},
 			},
 		},
@@ -797,8 +804,8 @@ func TestWaterfall_StopIfUnfundedHaltsSubsequentTiers(t *testing.T) {
 	// Rent got all $10M (less than needed $100M).
 	// Vacation got ZERO because Tier1 triggered stop_if_unfunded.
 	for _, a := range out.ProposedAllocations {
-		if a.CategoryID == "cat-vac" && a.AdditionalAssignment.Milliunits != 0 {
-			t.Errorf("cat-vac should be 0 (stop_if_unfunded), got %d", a.AdditionalAssignment.Milliunits)
+		if a.CategoryID == testCategoryIDAlt2 && a.AdditionalAssignment.Milliunits != 0 {
+			t.Errorf("testCategoryIDAlt2 should be 0 (stop_if_unfunded), got %d", a.AdditionalAssignment.Milliunits)
 		}
 	}
 	// Remainder = 0 (all $10M went to rent, though rent needed $100M)
@@ -811,10 +818,10 @@ func TestWaterfall_ZeroIncoming(t *testing.T) {
 	t.Parallel()
 	client, _ := testClient(t, waterfallMonthHandler())
 	_, out, err := client.YnabWaterfallAssignment(context.Background(), nil, YnabWaterfallAssignmentInput{
-		PlanID:                   "p",
+		PlanID:                   testPlanID,
 		IncomingAmountMilliunits: 0,
 		PriorityTiers: []WaterfallTier{
-			{Name: "T", Categories: []WaterfallCategory{{CategoryID: "cat-rent", NeedMilliunits: 1000000}}},
+			{Name: "T", Categories: []WaterfallCategory{{CategoryID: testCategoryID, NeedMilliunits: 1000000}}},
 		},
 	})
 	if err != nil {
@@ -840,13 +847,13 @@ func TestWaterfall_InputValidation(t *testing.T) {
 		in   YnabWaterfallAssignmentInput
 		want string
 	}{
-		{"no plan", YnabWaterfallAssignmentInput{IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: 500}}}}}, "plan_id"},
-		{"negative incoming", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: -1, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: 500}}}}}, "non-negative"},
-		{"empty tiers", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000}, "at least one tier"},
-		{"tier missing name", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: 500}}}}}, "name is required"},
-		{"tier empty categories", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t"}}}, "at least one category"},
-		{"category missing id", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{NeedMilliunits: 500}}}}}, "category_id is required"},
-		{"negative need", YnabWaterfallAssignmentInput{PlanID: "p", IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: "c", NeedMilliunits: -1}}}}}, "non-negative"},
+		{"no plan", YnabWaterfallAssignmentInput{IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: testCategoryID, NeedMilliunits: 500}}}}}, "plan_id"},
+		{"negative incoming", YnabWaterfallAssignmentInput{PlanID: testPlanID, IncomingAmountMilliunits: -1, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: testCategoryID, NeedMilliunits: 500}}}}}, "non-negative"},
+		{"empty tiers", YnabWaterfallAssignmentInput{PlanID: testPlanID, IncomingAmountMilliunits: 1000}, "at least one tier"},
+		{"tier missing name", YnabWaterfallAssignmentInput{PlanID: testPlanID, IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Categories: []WaterfallCategory{{CategoryID: testCategoryID, NeedMilliunits: 500}}}}}, "name is required"},
+		{"tier empty categories", YnabWaterfallAssignmentInput{PlanID: testPlanID, IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t"}}}, "at least one category"},
+		{"category missing id", YnabWaterfallAssignmentInput{PlanID: testPlanID, IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{NeedMilliunits: 500}}}}}, "category_id: invalid identifier"},
+		{"negative need", YnabWaterfallAssignmentInput{PlanID: testPlanID, IncomingAmountMilliunits: 1000, PriorityTiers: []WaterfallTier{{Name: "t", Categories: []WaterfallCategory{{CategoryID: testCategoryID, NeedMilliunits: -1}}}}}, "non-negative"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -872,11 +879,15 @@ func statusHandler(withDebtConfig bool) http.HandlerFunc {
 				"month":"2026-04-01","income":5000000,"budgeted":2500000,"activity":-800000,"to_be_budgeted":1500000,"age_of_money":45,"categories":[]
 			}}}`))
 		case strings.HasSuffix(p, "/accounts"):
-			_, _ = w.Write([]byte(`{"data":{"server_knowledge":1,"accounts":[
-				{"id":"acct-check","name":"Checking","type":"checking","on_budget":true,"closed":false,"balance":2000000,"cleared_balance":2000000,"uncleared_balance":0,"last_reconciled_at":"2026-04-01T00:00:00Z","deleted":false},
-				{"id":"acct-savings","name":"Savings","type":"savings","on_budget":true,"closed":false,"balance":10000000,"cleared_balance":10000000,"uncleared_balance":0,"last_reconciled_at":"2026-03-20T00:00:00Z","deleted":false},
-				{"id":"acct-cc","name":"Visa","type":"creditCard","on_budget":true,"closed":false,"balance":-1500000,"cleared_balance":-1500000,"uncleared_balance":0,"last_reconciled_at":null,"deleted":false}
-			]}}`))
+			// Wire the CC account id to testAccountID so the
+			// DebtAccountConfig input (which now requires canonical
+			// UUIDs per the validator) resolves to this fixture.
+			// Checking and savings use the alt constants.
+			_, _ = fmt.Fprintf(w, `{"data":{"server_knowledge":1,"accounts":[
+				{"id":%q,"name":"Checking","type":"checking","on_budget":true,"closed":false,"balance":2000000,"cleared_balance":2000000,"uncleared_balance":0,"last_reconciled_at":"2026-04-01T00:00:00Z","deleted":false},
+				{"id":%q,"name":"Savings","type":"savings","on_budget":true,"closed":false,"balance":10000000,"cleared_balance":10000000,"uncleared_balance":0,"last_reconciled_at":"2026-03-20T00:00:00Z","deleted":false},
+				{"id":%q,"name":"Visa","type":"creditCard","on_budget":true,"closed":false,"balance":-1500000,"cleared_balance":-1500000,"uncleared_balance":0,"last_reconciled_at":null,"deleted":false}
+			]}}`, testAccountIDAlt, testAccountIDAlt2, testAccountID)
 		case strings.HasSuffix(p, "/categories"):
 			_, _ = w.Write([]byte(`{"data":{"category_groups":[
 				{"id":"g-immediate","name":"Immediate","hidden":false,"deleted":false,"categories":[
@@ -915,9 +926,9 @@ func TestStatus_HappyPath(t *testing.T) {
 	t.Parallel()
 	client, _ := testClient(t, statusHandler(false))
 	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{
-		PlanID: "plan-1",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "acct-cc", Nickname: "My Visa", APRPercent: 24, MinimumPaymentMilliunits: 50000},
+			{AccountID: testAccountID, Nickname: "My Visa", APRPercent: 24, MinimumPaymentMilliunits: 50000},
 		},
 	})
 	if err != nil {
@@ -986,9 +997,9 @@ func TestStatus_HappyPath(t *testing.T) {
 	var daysForChecking *int
 	for _, e := range out.DaysSinceLastReconciled {
 		switch e.AccountID {
-		case "acct-cc":
+		case testAccountID:
 			daysForCC = e.Days
-		case "acct-check":
+		case testAccountIDAlt:
 			daysForChecking = e.Days
 		}
 	}
@@ -1071,7 +1082,7 @@ func TestWeeklyCheckin_PeriodBoundariesAndDeltas(t *testing.T) {
 	t.Parallel()
 	client, _ := testClient(t, weeklyCheckinHandler(false))
 	_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
-		PlanID:   "p",
+		PlanID:   testPlanID,
 		AsOfDate: "2026-04-14",
 	})
 	if err != nil {
@@ -1158,7 +1169,7 @@ func TestWeeklyCheckin_ExcludesTransfers(t *testing.T) {
 		}
 	})
 	_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
-		PlanID: "p", AsOfDate: "2026-04-14",
+		PlanID: testPlanID, AsOfDate: "2026-04-14",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1201,7 +1212,7 @@ func TestStatus_UnapprovedCountDeduplicatesTransfers(t *testing.T) {
 			http.Error(w, "unexpected URL: "+r.URL.Path, http.StatusNotFound)
 		}
 	})
-	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{PlanID: "p"})
+	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1285,7 +1296,7 @@ func TestWeeklyCheckin_AgeOfMoneyDeltaDistinguishesZeroFromNull(t *testing.T) {
 			}
 			client, _ := testClient(t, handler)
 			_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
-				PlanID: "p", AsOfDate: "2026-04-14",
+				PlanID: testPlanID, AsOfDate: "2026-04-14",
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1340,7 +1351,7 @@ func TestWeeklyCheckin_CategoryResolvedFromOverspent(t *testing.T) {
 		}
 	})
 	_, out, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
-		PlanID: "p", AsOfDate: "2026-04-14",
+		PlanID: testPlanID, AsOfDate: "2026-04-14",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1362,7 +1373,7 @@ func TestWeeklyCheckin_RequiresPlanID(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{})
-	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+	if err == nil || !strings.Contains(err.Error(), "plan_id: invalid identifier") {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -1373,7 +1384,7 @@ func TestWeeklyCheckin_BadDateRejected(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.YnabWeeklyCheckin(context.Background(), nil, YnabWeeklyCheckinInput{
-		PlanID: "p", AsOfDate: "April 14",
+		PlanID: testPlanID, AsOfDate: "April 14",
 	})
 	if err == nil || !strings.Contains(err.Error(), "YYYY-MM-DD") {
 		t.Errorf("wrong error: %v", err)
@@ -1408,9 +1419,9 @@ func TestStatus_CreditBalanceOnDebtAccountClampsToZero(t *testing.T) {
 		}
 	})
 	_, out, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		DebtAccountConfig: []DebtAccountConfig{
-			{AccountID: "cc", Nickname: "Visa", APRPercent: 24, MinimumPaymentMilliunits: 0},
+			{AccountID: testAccountID, Nickname: "Visa", APRPercent: 24, MinimumPaymentMilliunits: 0},
 		},
 	})
 	if err != nil {
@@ -1438,7 +1449,7 @@ func TestStatus_ContextCancelledShortCircuits(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled before the call
-	_, _, err := client.YnabStatus(ctx, nil, YnabStatusInput{PlanID: "p"})
+	_, _, err := client.YnabStatus(ctx, nil, YnabStatusInput{PlanID: testPlanID})
 	if err == nil {
 		t.Fatal("expected ctx.Err() to propagate, got nil")
 	}
@@ -1456,7 +1467,7 @@ func TestWeeklyCheckin_ContextCancelledShortCircuits(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := client.YnabWeeklyCheckin(ctx, nil, YnabWeeklyCheckinInput{PlanID: "p"})
+	_, _, err := client.YnabWeeklyCheckin(ctx, nil, YnabWeeklyCheckinInput{PlanID: testPlanID})
 	if err == nil {
 		t.Fatal("expected ctx.Err() to propagate")
 	}
@@ -1488,7 +1499,7 @@ func TestCreateTransaction_NowUTCOverridable(t *testing.T) {
 		}
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: -100, PayeeName: "Test",
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: -100, PayeeName: "Test",
 		// Date intentionally omitted to exercise the nowUTC default.
 	})
 	if err != nil {
@@ -1506,7 +1517,7 @@ func TestStatus_RequiresPlanID(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.YnabStatus(context.Background(), nil, YnabStatusInput{})
-	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+	if err == nil || !strings.Contains(err.Error(), "plan_id: invalid identifier") {
 		t.Errorf("wrong error: %v", err)
 	}
 }

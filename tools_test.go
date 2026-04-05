@@ -77,11 +77,11 @@ func TestGetMonth_DefaultsToCurrent(t *testing.T) {
 			"categories":[]
 		}}}`))
 	})
-	_, out, err := client.GetMonth(context.Background(), nil, GetMonthInput{PlanID: "plan-123"})
+	_, out, err := client.GetMonth(context.Background(), nil, GetMonthInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenPath != "/plans/plan-123/months/current" {
+	if seenPath != "/plans/"+testPlanID+"/months/current" {
 		t.Errorf("wrong path, got %q", seenPath)
 	}
 	assertMoney(t, "Income", out.Income, 5000000, "5000.000")
@@ -99,7 +99,7 @@ func TestGetMonth_RequiresPlanID(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.GetMonth(context.Background(), nil, GetMonthInput{})
-	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+	if err == nil || !strings.Contains(err.Error(), "plan_id: invalid identifier") {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -116,7 +116,7 @@ func TestListAccounts_FiltersDeletedAndClosed(t *testing.T) {
 			{"id":"c","name":"Ghost","type":"cash","on_budget":false,"closed":false,"balance":0,"cleared_balance":0,"uncleared_balance":0,"deleted":true}
 		]}}`))
 	})
-	_, out, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: "p"})
+	_, out, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestListAccounts_IncludeClosed(t *testing.T) {
 			{"id":"b","name":"Old","type":"savings","on_budget":true,"closed":true,"balance":0,"cleared_balance":0,"uncleared_balance":0,"deleted":false}
 		]}}`))
 	})
-	_, out, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: "p", IncludeClosed: true})
+	_, out, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: testPlanID, IncludeClosed: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestListTransactions_SortsDescAndTruncates(t *testing.T) {
 		]}}`))
 	})
 	_, out, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID:    "p",
+		PlanID:    testPlanID,
 		SinceDate: "2026-03-01",
 		Limit:     2,
 	})
@@ -187,7 +187,7 @@ func TestListTransactions_InvalidTypeRejected(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID: "p",
+		PlanID: testPlanID,
 		Type:   "delete_everything",
 	})
 	if err == nil || !strings.Contains(err.Error(), "uncategorized") {
@@ -233,7 +233,7 @@ func TestListTransactions_LimitCapping(t *testing.T) {
 	}
 	for _, c := range cases {
 		_, out, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-			PlanID: "p", Limit: c.in, SinceDate: "2020-01-01",
+			PlanID: testPlanID, Limit: c.in, SinceDate: "2020-01-01",
 		})
 		if err != nil {
 			t.Errorf("limit %d: %v", c.in, err)
@@ -264,7 +264,7 @@ func TestListCategories_FlattensAndFilters(t *testing.T) {
 			]}
 		]}}`))
 	})
-	_, out, err := client.ListCategories(context.Background(), nil, ListCategoriesInput{PlanID: "p"})
+	_, out, err := client.ListCategories(context.Background(), nil, ListCategoriesInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,11 +290,11 @@ func TestListPayees_Success(t *testing.T) {
 			{"id":"p3","name":"Transfer: Savings","transfer_account_id":"acct-s","deleted":false}
 		]}}`))
 	})
-	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: "plan-1"})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenPath != "/plans/plan-1/payees" {
+	if seenPath != "/plans/"+testPlanID+"/payees" {
 		t.Errorf("wrong path: %s", seenPath)
 	}
 	if len(out.Payees) != 3 {
@@ -324,7 +324,7 @@ func TestListPayees_NameContainsCaseInsensitive(t *testing.T) {
 		]}}`))
 	})
 	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{
-		PlanID:       "p",
+		PlanID:       testPlanID,
 		NameContains: "chipotle",
 	})
 	if err != nil {
@@ -353,7 +353,7 @@ func TestListPayees_NameContainsUppercaseInputStillCaseInsensitive(t *testing.T)
 	})
 	// Caller passes uppercase; should still match lowercase payee name.
 	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{
-		PlanID: "p", NameContains: "STARBUCKS",
+		PlanID: testPlanID, NameContains: "STARBUCKS",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -372,7 +372,7 @@ func TestListPayees_FiltersDeletedByDefault(t *testing.T) {
 			{"id":"p2","name":"Deleted","deleted":true}
 		]}}`))
 	})
-	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: "p"})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestListPayees_IncludeDeleted(t *testing.T) {
 			{"id":"p2","name":"Deleted","deleted":true}
 		]}}`))
 	})
-	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: "p", IncludeDeleted: true})
+	_, out, err := client.ListPayees(context.Background(), nil, ListPayeesInput{PlanID: testPlanID, IncludeDeleted: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestListPayees_RequiresPlanID(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.ListPayees(context.Background(), nil, ListPayeesInput{})
-	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+	if err == nil || !strings.Contains(err.Error(), "plan_id: invalid identifier") {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -423,13 +423,13 @@ func TestListTransactions_AccountFilterHitsAccountEndpoint(t *testing.T) {
 		]}}`))
 	})
 	_, out, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID:    "p",
-		AccountID: "acct-1",
+		PlanID:    testPlanID,
+		AccountID: testAccountID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenPath != "/plans/p/accounts/acct-1/transactions" {
+	if seenPath != "/plans/"+testPlanID+"/accounts/"+testAccountID+"/transactions" {
 		t.Errorf("wrong path, got %q", seenPath)
 	}
 	if len(out.Transactions) != 1 || out.Transactions[0].IsSubtransaction {
@@ -451,13 +451,13 @@ func TestListTransactions_CategoryFilterHitsHybridEndpointAndFlagsSubtransaction
 		]}}`))
 	})
 	_, out, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID:     "p",
-		CategoryID: "cat-99",
+		PlanID:     testPlanID,
+		CategoryID: testCategoryID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenPath != "/plans/p/categories/cat-99/transactions" {
+	if seenPath != "/plans/"+testPlanID+"/categories/"+testCategoryID+"/transactions" {
 		t.Errorf("wrong path, got %q", seenPath)
 	}
 	if len(out.Transactions) != 2 {
@@ -481,13 +481,13 @@ func TestListTransactions_PayeeFilterHitsPayeeEndpoint(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":{"transactions":[]}}`))
 	})
 	_, _, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID:  "p",
-		PayeeID: "payee-7",
+		PlanID:  testPlanID,
+		PayeeID: testPayeeID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenPath != "/plans/p/payees/payee-7/transactions" {
+	if seenPath != "/plans/"+testPlanID+"/payees/"+testPayeeID+"/transactions" {
 		t.Errorf("wrong path, got %q", seenPath)
 	}
 }
@@ -498,10 +498,10 @@ func TestListTransactions_RejectsMultipleScopeFilters(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	cases := []ListTransactionsInput{
-		{PlanID: "p", AccountID: "a", CategoryID: "c"},
-		{PlanID: "p", AccountID: "a", PayeeID: "y"},
-		{PlanID: "p", CategoryID: "c", PayeeID: "y"},
-		{PlanID: "p", AccountID: "a", CategoryID: "c", PayeeID: "y"},
+		{PlanID: testPlanID, AccountID: testAccountID, CategoryID: testCategoryID},
+		{PlanID: testPlanID, AccountID: testAccountID, PayeeID: testPayeeID},
+		{PlanID: testPlanID, CategoryID: testCategoryID, PayeeID: testPayeeID},
+		{PlanID: testPlanID, AccountID: testAccountID, CategoryID: testCategoryID, PayeeID: testPayeeID},
 	}
 	for _, in := range cases {
 		_, _, err := client.ListTransactions(context.Background(), nil, in)
@@ -521,8 +521,8 @@ func TestListTransactions_DeletedHybridRowsFiltered(t *testing.T) {
 		]}}`))
 	})
 	_, out, err := client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID:     "p",
-		CategoryID: "cat",
+		PlanID:     testPlanID,
+		CategoryID: testCategoryID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -537,7 +537,7 @@ func TestListTransactions_DeletedHybridRowsFiltered(t *testing.T) {
 func TestListMonths_SortsDescAndFiltersDeleted(t *testing.T) {
 	t.Parallel()
 	client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/plans/p/months" {
+		if r.URL.Path != "/plans/"+testPlanID+"/months" {
 			t.Errorf("wrong path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -549,7 +549,7 @@ func TestListMonths_SortsDescAndFiltersDeleted(t *testing.T) {
 			{"month":"2020-01-01","income":0,"budgeted":0,"activity":0,"to_be_budgeted":0,"deleted":true}
 		]}}`))
 	})
-	_, out, err := client.ListMonths(context.Background(), nil, ListMonthsInput{PlanID: "p", Limit: 3})
+	_, out, err := client.ListMonths(context.Background(), nil, ListMonthsInput{PlanID: testPlanID, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +586,7 @@ func TestListMonths_LimitDefaultAndCap(t *testing.T) {
 		_, _ = w.Write([]byte(body.String()))
 	})
 	// Default limit = 6.
-	_, out, err := client.ListMonths(context.Background(), nil, ListMonthsInput{PlanID: "p"})
+	_, out, err := client.ListMonths(context.Background(), nil, ListMonthsInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +594,7 @@ func TestListMonths_LimitDefaultAndCap(t *testing.T) {
 		t.Errorf("default limit: expected 6, got %d", len(out.Months))
 	}
 	// Requested 9999 → capped to 60.
-	_, out, err = client.ListMonths(context.Background(), nil, ListMonthsInput{PlanID: "p", Limit: 9999})
+	_, out, err = client.ListMonths(context.Background(), nil, ListMonthsInput{PlanID: testPlanID, Limit: 9999})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,7 +609,7 @@ func TestListMonths_RequiresPlanID(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.ListMonths(context.Background(), nil, ListMonthsInput{})
-	if err == nil || !strings.Contains(err.Error(), "plan_id is required") {
+	if err == nil || !strings.Contains(err.Error(), "plan_id: invalid identifier") {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -628,11 +628,11 @@ func TestListScheduledTransactions_Success(t *testing.T) {
 			{"id":"gone","date_first":"2020-01-01","date_next":"2020-01-01","frequency":"never","amount":0,"account_id":"a","account_name":"Checking","deleted":true}
 		]}}`))
 	})
-	_, out, err := client.ListScheduledTransactions(context.Background(), nil, ListScheduledTransactionsInput{PlanID: "p"})
+	_, out, err := client.ListScheduledTransactions(context.Background(), nil, ListScheduledTransactionsInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenPath != "/plans/p/scheduled_transactions" {
+	if seenPath != "/plans/"+testPlanID+"/scheduled_transactions" {
 		t.Errorf("wrong path: %q", seenPath)
 	}
 	if len(out.ScheduledTransactions) != 2 {
@@ -664,7 +664,7 @@ func TestListScheduledTransactions_UpcomingDaysFilter(t *testing.T) {
 	})
 	// upcoming_days=1 should exclude the far-future one.
 	_, out, err := client.ListScheduledTransactions(context.Background(), nil, ListScheduledTransactionsInput{
-		PlanID:       "p",
+		PlanID:       testPlanID,
 		UpcomingDays: 1,
 	})
 	if err != nil {
@@ -682,7 +682,7 @@ func TestListScheduledTransactions_RejectsInvalidUpcomingDays(t *testing.T) {
 	})
 	for _, d := range []int{-1, -100, 366, 9999} {
 		_, _, err := client.ListScheduledTransactions(context.Background(), nil, ListScheduledTransactionsInput{
-			PlanID:       "p",
+			PlanID:       testPlanID,
 			UpcomingDays: d,
 		})
 		if err == nil {
@@ -702,7 +702,7 @@ func TestListCategories_IncludeHidden(t *testing.T) {
 			]}
 		]}}`))
 	})
-	_, out, err := client.ListCategories(context.Background(), nil, ListCategoriesInput{PlanID: "p", IncludeHidden: true})
+	_, out, err := client.ListCategories(context.Background(), nil, ListCategoriesInput{PlanID: testPlanID, IncludeHidden: true})
 	if err != nil {
 		t.Fatal(err)
 	}

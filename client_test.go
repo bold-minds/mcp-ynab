@@ -234,55 +234,55 @@ func TestLogLeak_PathologicalRoundTripper(t *testing.T) {
 			return err
 		}},
 		{"GetMonth", func() error {
-			_, _, err := client.GetMonth(ctx, nil, GetMonthInput{PlanID: "p"})
+			_, _, err := client.GetMonth(ctx, nil, GetMonthInput{PlanID: testPlanID})
 			return err
 		}},
 		{"ListAccounts", func() error {
-			_, _, err := client.ListAccounts(ctx, nil, ListAccountsInput{PlanID: "p"})
+			_, _, err := client.ListAccounts(ctx, nil, ListAccountsInput{PlanID: testPlanID})
 			return err
 		}},
 		{"ListTransactions", func() error {
-			_, _, err := client.ListTransactions(ctx, nil, ListTransactionsInput{PlanID: "p"})
+			_, _, err := client.ListTransactions(ctx, nil, ListTransactionsInput{PlanID: testPlanID})
 			return err
 		}},
 		{"ListCategories", func() error {
-			_, _, err := client.ListCategories(ctx, nil, ListCategoriesInput{PlanID: "p"})
+			_, _, err := client.ListCategories(ctx, nil, ListCategoriesInput{PlanID: testPlanID})
 			return err
 		}},
 		{"ListMonths", func() error {
-			_, _, err := client.ListMonths(ctx, nil, ListMonthsInput{PlanID: "p"})
+			_, _, err := client.ListMonths(ctx, nil, ListMonthsInput{PlanID: testPlanID})
 			return err
 		}},
 		{"ListScheduledTransactions", func() error {
-			_, _, err := client.ListScheduledTransactions(ctx, nil, ListScheduledTransactionsInput{PlanID: "p"})
+			_, _, err := client.ListScheduledTransactions(ctx, nil, ListScheduledTransactionsInput{PlanID: testPlanID})
 			return err
 		}},
 		{"ListPayees", func() error {
-			_, _, err := client.ListPayees(ctx, nil, ListPayeesInput{PlanID: "p"})
+			_, _, err := client.ListPayees(ctx, nil, ListPayeesInput{PlanID: testPlanID})
 			return err
 		}},
 		// Write tools (new in v0.2)
 		{"CreateTransaction", func() error {
 			_, _, err := client.CreateTransaction(ctx, emptyReq(), CreateTransactionInput{
-				PlanID: "p", AccountID: "a", AmountMilliunits: -1000, PayeeName: "X",
+				PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: -1000, PayeeName: "X",
 			})
 			return err
 		}},
 		{"UpdateCategoryBudgeted", func() error {
 			_, _, err := client.UpdateCategoryBudgeted(ctx, emptyReq(), UpdateCategoryBudgetedInput{
-				PlanID: "p", Month: "current", CategoryID: "c", NewBudgetedMilliunits: 100000,
+				PlanID: testPlanID, Month: "current", CategoryID: testCategoryID, NewBudgetedMilliunits: 100000,
 			})
 			return err
 		}},
 		{"UpdateTransaction", func() error {
 			_, _, err := client.UpdateTransaction(ctx, emptyReq(), UpdateTransactionInput{
-				PlanID: "p", TransactionID: "t", Approved: &approved,
+				PlanID: testPlanID, TransactionID: testTransactionID, Approved: &approved,
 			})
 			return err
 		}},
 		{"ApproveTransaction", func() error {
 			_, _, err := client.ApproveTransaction(ctx, emptyReq(), ApproveTransactionInput{
-				PlanID: "p", TransactionID: "t",
+				PlanID: testPlanID, TransactionID: testTransactionID,
 			})
 			return err
 		}},
@@ -332,7 +332,7 @@ func TestLogLeak_WriteBodyNotEchoedInError(t *testing.T) {
 		baseURL:    "https://api.ynab.com/v1",
 	}
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: -1000,
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: -1000,
 		PayeeName: "Test",
 		Memo:      secretMemo,
 	})
@@ -538,7 +538,7 @@ func TestDeltaSync_Accounts_FirstCallPopulatesCache(t *testing.T) {
 		}
 	})
 
-	_, out1, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: "plan-1"})
+	_, out1, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,7 +546,7 @@ func TestDeltaSync_Accounts_FirstCallPopulatesCache(t *testing.T) {
 		t.Errorf("first call: expected 3 accounts, got %d", len(out1.Accounts))
 	}
 
-	_, out2, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: "plan-1"})
+	_, out2, err := client.ListAccounts(context.Background(), nil, ListAccountsInput{PlanID: testPlanID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,16 +599,16 @@ func TestDeltaSync_Transactions_UnfilteredOnly(t *testing.T) {
 
 	// Call 1: omitted since_date → H2 default (90d window), first call
 	// so no cached knowledge.
-	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: testPlanID})
 	// Call 2: cache is now primed, omitted since_date → handler keeps
 	// since_date empty to let the fetch layer delta-sync from cache.
-	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: testPlanID})
 	// Call 3: explicit since_date still delta-syncs via the relaxed gate.
 	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{
-		PlanID: "plan-1", SinceDate: "2026-01-01",
+		PlanID: testPlanID, SinceDate: "2026-01-01",
 	})
 	// Call 4: same as call 2, cache still primed.
-	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: "plan-1"})
+	_, _, _ = client.ListTransactions(context.Background(), nil, ListTransactionsInput{PlanID: testPlanID})
 
 	if len(seenQueries) != 4 {
 		t.Fatalf("expected 4 requests, got %d", len(seenQueries))

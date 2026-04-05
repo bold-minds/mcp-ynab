@@ -109,8 +109,8 @@ type YnabDebtSnapshotOutput struct {
 // Integer milliunit arithmetic throughout; no floats in the compounding
 // loop. See the file-level comment for approximation bounds.
 func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, in YnabDebtSnapshotInput) (*mcp.CallToolResult, YnabDebtSnapshotOutput, error) {
-	if in.PlanID == "" {
-		return nil, YnabDebtSnapshotOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, YnabDebtSnapshotOutput{}, err
 	}
 	if len(in.DebtAccountConfig) == 0 {
 		return nil, YnabDebtSnapshotOutput{}, errors.New("debt_account_config must contain at least one account")
@@ -132,9 +132,9 @@ func (c *Client) YnabDebtSnapshot(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 
 	// Validate APRs and minimum payments.
-	for _, cfg := range in.DebtAccountConfig {
-		if cfg.AccountID == "" {
-			return nil, YnabDebtSnapshotOutput{}, errors.New("every debt_account_config entry must have account_id")
+	for i, cfg := range in.DebtAccountConfig {
+		if err := validateEntityID(fmt.Sprintf("debt_account_config[%d].account_id", i), cfg.AccountID); err != nil {
+			return nil, YnabDebtSnapshotOutput{}, err
 		}
 		if cfg.APRPercent < 0 {
 			return nil, YnabDebtSnapshotOutput{}, fmt.Errorf("apr_percent must be non-negative (account %s)", cfg.AccountID)
@@ -697,8 +697,18 @@ var liquidAccountTypes = map[string]bool{
 // list_accounts + list_categories + list_transactions(type=unapproved) +
 // list_scheduled_transactions + get_month(current).
 func (c *Client) YnabStatus(ctx context.Context, _ *mcp.CallToolRequest, in YnabStatusInput) (*mcp.CallToolResult, YnabStatusOutput, error) {
-	if in.PlanID == "" {
-		return nil, YnabStatusOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, YnabStatusOutput{}, err
+	}
+	// YnabStatus forwards debt_account_config into the avalanche math
+	// layer, which keys by account_id. Validate the ids at the boundary
+	// so a typo produces a clean "debt_account_config[i].account_id:"
+	// error instead of an opaque upstream 404 from the account snapshot
+	// fetch. Review finding on broader UUID validation.
+	for i, cfg := range in.DebtAccountConfig {
+		if err := validateEntityID(fmt.Sprintf("debt_account_config[%d].account_id", i), cfg.AccountID); err != nil {
+			return nil, YnabStatusOutput{}, err
+		}
 	}
 	// Resolve as_of anchor. When omitted, use current UTC. When provided,
 	// require YYYY-MM-DD. All time-dependent math below (7-day scheduled
@@ -999,8 +1009,8 @@ type YnabWeeklyCheckinOutput struct {
 // YnabWeeklyCheckin composes multiple reads to build a week-over-week
 // narrative plus a month-over-month overspent comparison.
 func (c *Client) YnabWeeklyCheckin(ctx context.Context, _ *mcp.CallToolRequest, in YnabWeeklyCheckinInput) (*mcp.CallToolResult, YnabWeeklyCheckinOutput, error) {
-	if in.PlanID == "" {
-		return nil, YnabWeeklyCheckinOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, YnabWeeklyCheckinOutput{}, err
 	}
 	// Check for caller cancellation up-front. Review finding L13.
 	if err := ctx.Err(); err != nil {
@@ -1250,11 +1260,26 @@ const maxOffendingTransactions = 50
 // give a verdict on incomplete data), and sets VerdictUnavailableReason
 // for the LLM to relay.
 func (c *Client) YnabSpendingCheck(ctx context.Context, _ *mcp.CallToolRequest, in YnabSpendingCheckInput) (*mcp.CallToolResult, YnabSpendingCheckOutput, error) {
-	if in.PlanID == "" {
-		return nil, YnabSpendingCheckOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, YnabSpendingCheckOutput{}, err
 	}
 	if len(in.CategoryIDs) == 0 {
 		return nil, YnabSpendingCheckOutput{}, errors.New("category_ids must contain at least one category")
+	}
+	// Validate every id up-front. YnabSpendingCheck iterates category_ids
+	// and issues one HTTP call per entry, so a single bad id buried in
+	// the middle would otherwise succeed on N calls and then blow up on
+	// the (N+1)th — the aggregation would already be mid-flight. Fail
+	// closed at the boundary. Review finding on broader UUID validation.
+	for i, id := range in.CategoryIDs {
+		if err := validateEntityID(fmt.Sprintf("category_ids[%d]", i), id); err != nil {
+			return nil, YnabSpendingCheckOutput{}, err
+		}
+	}
+	for i, id := range in.ExcludedPayeeIDs {
+		if err := validateEntityID(fmt.Sprintf("excluded_payee_ids[%d]", i), id); err != nil {
+			return nil, YnabSpendingCheckOutput{}, err
+		}
 	}
 	// Cap the number of categories to keep worst-case latency bounded.
 	// YnabSpendingCheck issues one sequential HTTP call per category
@@ -1497,8 +1522,8 @@ type YnabWaterfallAssignmentOutput struct {
 // allocations. Zero writes to YNAB; the skill calls update_category_budgeted
 // separately if the user approves.
 func (c *Client) YnabWaterfallAssignment(ctx context.Context, _ *mcp.CallToolRequest, in YnabWaterfallAssignmentInput) (*mcp.CallToolResult, YnabWaterfallAssignmentOutput, error) {
-	if in.PlanID == "" {
-		return nil, YnabWaterfallAssignmentOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, YnabWaterfallAssignmentOutput{}, err
 	}
 	if in.IncomingAmountMilliunits < 0 {
 		return nil, YnabWaterfallAssignmentOutput{}, errors.New("incoming_amount_milliunits must be non-negative")
@@ -1514,8 +1539,8 @@ func (c *Client) YnabWaterfallAssignment(ctx context.Context, _ *mcp.CallToolReq
 			return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d] (%q) must contain at least one category", i, tier.Name)
 		}
 		for j, cat := range tier.Categories {
-			if cat.CategoryID == "" {
-				return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d].categories[%d].category_id is required", i, j)
+			if err := validateEntityID(fmt.Sprintf("priority_tiers[%d].categories[%d].category_id", i, j), cat.CategoryID); err != nil {
+				return nil, YnabWaterfallAssignmentOutput{}, err
 			}
 			if cat.NeedMilliunits < 0 {
 				return nil, YnabWaterfallAssignmentOutput{}, fmt.Errorf("priority_tiers[%d].categories[%d].need_milliunits must be non-negative", i, j)

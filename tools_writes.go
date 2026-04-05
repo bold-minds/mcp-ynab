@@ -279,20 +279,20 @@ func (c *Client) CreateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if err := requireWriteAllowed(); err != nil {
 		return nil, CreateTransactionOutput{}, sanitizedErr(err)
 	}
-	if err := validateIDShape(in.PlanID); err != nil {
-		return nil, CreateTransactionOutput{}, errors.New("plan_id: " + err.Error())
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, CreateTransactionOutput{}, err
 	}
-	if err := validateIDShape(in.AccountID); err != nil {
-		return nil, CreateTransactionOutput{}, errors.New("account_id: " + err.Error())
+	if err := validateEntityID("account_id", in.AccountID); err != nil {
+		return nil, CreateTransactionOutput{}, err
 	}
 	if in.CategoryID != "" {
-		if err := validateIDShape(in.CategoryID); err != nil {
-			return nil, CreateTransactionOutput{}, errors.New("category_id: " + err.Error())
+		if err := validateEntityID("category_id", in.CategoryID); err != nil {
+			return nil, CreateTransactionOutput{}, err
 		}
 	}
 	if in.PayeeID != "" {
-		if err := validateIDShape(in.PayeeID); err != nil {
-			return nil, CreateTransactionOutput{}, errors.New("payee_id: " + err.Error())
+		if err := validateEntityID("payee_id", in.PayeeID); err != nil {
+			return nil, CreateTransactionOutput{}, err
 		}
 	}
 	if in.PayeeName == "" && in.PayeeID == "" {
@@ -465,11 +465,11 @@ func (c *Client) UpdateCategoryBudgeted(ctx context.Context, req *mcp.CallToolRe
 	if err := requireWriteAllowed(); err != nil {
 		return nil, UpdateCategoryBudgetedOutput{}, sanitizedErr(err)
 	}
-	if err := validateIDShape(in.PlanID); err != nil {
-		return nil, UpdateCategoryBudgetedOutput{}, errors.New("plan_id: " + err.Error())
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, UpdateCategoryBudgetedOutput{}, err
 	}
-	if err := validateIDShape(in.CategoryID); err != nil {
-		return nil, UpdateCategoryBudgetedOutput{}, errors.New("category_id: " + err.Error())
+	if err := validateEntityID("category_id", in.CategoryID); err != nil {
+		return nil, UpdateCategoryBudgetedOutput{}, err
 	}
 	month := in.Month
 	if month == "" {
@@ -571,11 +571,11 @@ func (c *Client) UpdateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if err := requireWriteAllowed(); err != nil {
 		return nil, UpdateTransactionOutput{}, sanitizedErr(err)
 	}
-	if err := validateIDShape(in.PlanID); err != nil {
-		return nil, UpdateTransactionOutput{}, errors.New("plan_id: " + err.Error())
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, UpdateTransactionOutput{}, err
 	}
-	if err := validateIDShape(in.TransactionID); err != nil {
-		return nil, UpdateTransactionOutput{}, errors.New("transaction_id: " + err.Error())
+	if err := validateEntityID("transaction_id", in.TransactionID); err != nil {
+		return nil, UpdateTransactionOutput{}, err
 	}
 
 	// Validate mutable field subset and collect the non-nil ones for the
@@ -583,6 +583,20 @@ func (c *Client) UpdateTransaction(ctx context.Context, req *mcp.CallToolRequest
 	if in.CategoryID == nil && in.PayeeID == nil && in.PayeeName == nil &&
 		in.Memo == nil && in.Approved == nil && in.Cleared == nil && in.FlagColor == nil {
 		return nil, UpdateTransactionOutput{}, errors.New("at least one field must be specified to update")
+	}
+
+	// UUID shape checks on the optional scope-changing fields. PayeeName
+	// is a free-form string and is NOT validated here — only id fields
+	// are. Review finding on broader UUID validation.
+	if in.CategoryID != nil {
+		if err := validateEntityID("category_id", *in.CategoryID); err != nil {
+			return nil, UpdateTransactionOutput{}, err
+		}
+	}
+	if in.PayeeID != nil {
+		if err := validateEntityID("payee_id", *in.PayeeID); err != nil {
+			return nil, UpdateTransactionOutput{}, err
+		}
 	}
 
 	// Length checks operate on runes, not bytes. The docs and the error
@@ -627,11 +641,11 @@ func (c *Client) ApproveTransaction(ctx context.Context, req *mcp.CallToolReques
 	if err := requireWriteAllowed(); err != nil {
 		return nil, UpdateTransactionOutput{}, sanitizedErr(err)
 	}
-	if err := validateIDShape(in.PlanID); err != nil {
-		return nil, UpdateTransactionOutput{}, errors.New("plan_id: " + err.Error())
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, UpdateTransactionOutput{}, err
 	}
-	if err := validateIDShape(in.TransactionID); err != nil {
-		return nil, UpdateTransactionOutput{}, errors.New("transaction_id: " + err.Error())
+	if err := validateEntityID("transaction_id", in.TransactionID); err != nil {
+		return nil, UpdateTransactionOutput{}, err
 	}
 	approved := true
 	return c.doUpdateTransaction(ctx, req, UpdateTransactionInput{

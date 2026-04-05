@@ -41,24 +41,69 @@ func validateISODate(s string) error {
 	return nil
 }
 
-// validateIDShape is a minimal sanity check for identifier-shaped
-// arguments. It rejects empty strings, control characters, and anything
-// containing '/' or '?' — the three shapes that would let a caller break
-// out of the path segment url.PathEscape builds. url.PathEscape is the
-// real defense; this check gives callers a clearer boundary error
-// ("field: invalid identifier") instead of an upstream 400/404. It
-// deliberately does NOT enforce UUID formatting: YNAB accepts
-// plan-lookup keywords ("default", "last-used") and some ids in the
-// wild are not canonical 8-4-4-4-12. Review finding on UUID shape
-// validation.
-func validateIDShape(s string) error {
-	if s == "" {
-		return errors.New("invalid identifier: empty")
+// validateUUIDOrLookup verifies that s is either a canonical YNAB
+// identifier (a 36-character hex UUID in 8-4-4-4-12 form) or, when
+// allowLookup is true, one of YNAB's documented plan_id lookup keywords
+// ("default" / "last-used"). It is the tool-boundary guard for every
+// identifier-typed argument the MCP exposes.
+//
+// Why not a regex: a hand-rolled loop is (a) allocation-free, (b)
+// trivially inspectable for correctness, and (c) produces a predictable
+// error shape ("invalid identifier: must be a UUID") without the extra
+// dependency or compile-time cost of regexp.
+//
+// What this function is NOT: a defense against path-segment escape.
+// url.PathEscape is still the authoritative defense against `/`, `?`,
+// `#`, and control characters in outbound URLs. This validator is
+// defense-in-depth plus a UX improvement — an LLM that sends a typo'd
+// "plan-1" string gets a clean local error instead of an opaque
+// upstream 404, and rate-budget is preserved because the doomed request
+// never leaves the process. Review finding on broader UUID validation.
+//
+// UUID-version bits are NOT checked: YNAB does not document the version
+// it mints and some ids in the wild are not v4. The shape check is
+// what a malformed id fails, which is enough for the goals above.
+func validateUUIDOrLookup(s string, allowLookup bool) error {
+	if allowLookup && (s == "default" || s == "last-used") {
+		return nil
 	}
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f || r == '/' || r == '?' || r == '#' {
-			return errors.New("invalid identifier: contains disallowed character")
+	if len(s) != 36 {
+		return errors.New("invalid identifier: must be a UUID")
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return errors.New("invalid identifier: must be a UUID")
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return errors.New("invalid identifier: must be a UUID")
+			}
 		}
+	}
+	return nil
+}
+
+// validatePlanID is the call-site-local wrapper that adds the field
+// name to the error and enables plan-lookup keywords. Handlers should
+// use this rather than calling validateUUIDOrLookup directly so the
+// error message is consistently "plan_id: ...".
+func validatePlanID(s string) error {
+	if err := validateUUIDOrLookup(s, true); err != nil {
+		return errors.New("plan_id: " + err.Error())
+	}
+	return nil
+}
+
+// validateEntityID is the call-site-local wrapper for non-plan
+// identifier fields (account_id, category_id, payee_id, transaction_id).
+// It prefixes the field name and disables lookup keywords — those are
+// only valid on plan_id.
+func validateEntityID(field, s string) error {
+	if err := validateUUIDOrLookup(s, false); err != nil {
+		return errors.New(field + ": " + err.Error())
 	}
 	return nil
 }
@@ -183,8 +228,8 @@ func (c *Client) ListPlans(ctx context.Context, _ *mcp.CallToolRequest, _ ListPl
 }
 
 func (c *Client) GetMonth(ctx context.Context, _ *mcp.CallToolRequest, in GetMonthInput) (*mcp.CallToolResult, Month, error) {
-	if in.PlanID == "" {
-		return nil, Month{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, Month{}, err
 	}
 	month := in.Month
 	if month == "" {
@@ -202,8 +247,8 @@ func (c *Client) GetMonth(ctx context.Context, _ *mcp.CallToolRequest, in GetMon
 }
 
 func (c *Client) ListAccounts(ctx context.Context, _ *mcp.CallToolRequest, in ListAccountsInput) (*mcp.CallToolResult, ListAccountsOutput, error) {
-	if in.PlanID == "" {
-		return nil, ListAccountsOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, ListAccountsOutput{}, err
 	}
 	path := "/plans/" + url.PathEscape(in.PlanID) + "/accounts"
 
@@ -246,20 +291,29 @@ func (c *Client) ListAccounts(ctx context.Context, _ *mcp.CallToolRequest, in Li
 }
 
 func (c *Client) ListTransactions(ctx context.Context, _ *mcp.CallToolRequest, in ListTransactionsInput) (*mcp.CallToolResult, ListTransactionsOutput, error) {
-	if in.PlanID == "" {
-		return nil, ListTransactionsOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, ListTransactionsOutput{}, err
 	}
 	// At most one scope filter. YNAB has separate endpoints per scope and
 	// combining them would require ambiguous client-side logic — cleaner
 	// to make the LLM pick one and compose client-side if needed.
 	scopeCount := 0
 	if in.AccountID != "" {
+		if err := validateEntityID("account_id", in.AccountID); err != nil {
+			return nil, ListTransactionsOutput{}, err
+		}
 		scopeCount++
 	}
 	if in.CategoryID != "" {
+		if err := validateEntityID("category_id", in.CategoryID); err != nil {
+			return nil, ListTransactionsOutput{}, err
+		}
 		scopeCount++
 	}
 	if in.PayeeID != "" {
+		if err := validateEntityID("payee_id", in.PayeeID); err != nil {
+			return nil, ListTransactionsOutput{}, err
+		}
 		scopeCount++
 	}
 	if scopeCount > 1 {
@@ -509,8 +563,8 @@ func hybridToTransactions(in []wireHybridTransaction) []Transaction {
 }
 
 func (c *Client) ListMonths(ctx context.Context, _ *mcp.CallToolRequest, in ListMonthsInput) (*mcp.CallToolResult, ListMonthsOutput, error) {
-	if in.PlanID == "" {
-		return nil, ListMonthsOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, ListMonthsOutput{}, err
 	}
 	limit := in.Limit
 	switch {
@@ -546,8 +600,8 @@ func (c *Client) ListMonths(ctx context.Context, _ *mcp.CallToolRequest, in List
 }
 
 func (c *Client) ListScheduledTransactions(ctx context.Context, _ *mcp.CallToolRequest, in ListScheduledTransactionsInput) (*mcp.CallToolResult, ListScheduledTransactionsOutput, error) {
-	if in.PlanID == "" {
-		return nil, ListScheduledTransactionsOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, ListScheduledTransactionsOutput{}, err
 	}
 	if in.UpcomingDays < 0 {
 		return nil, ListScheduledTransactionsOutput{}, errors.New("upcoming_days must be non-negative")
@@ -592,8 +646,8 @@ func (c *Client) ListScheduledTransactions(ctx context.Context, _ *mcp.CallToolR
 }
 
 func (c *Client) ListPayees(ctx context.Context, _ *mcp.CallToolRequest, in ListPayeesInput) (*mcp.CallToolResult, ListPayeesOutput, error) {
-	if in.PlanID == "" {
-		return nil, ListPayeesOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, ListPayeesOutput{}, err
 	}
 	path := "/plans/" + url.PathEscape(in.PlanID) + "/payees"
 	var wire wirePayeesResponse
@@ -629,8 +683,8 @@ func (c *Client) ListPayees(ctx context.Context, _ *mcp.CallToolRequest, in List
 }
 
 func (c *Client) ListCategories(ctx context.Context, _ *mcp.CallToolRequest, in ListCategoriesInput) (*mcp.CallToolResult, ListCategoriesOutput, error) {
-	if in.PlanID == "" {
-		return nil, ListCategoriesOutput{}, errors.New("plan_id is required")
+	if err := validatePlanID(in.PlanID); err != nil {
+		return nil, ListCategoriesOutput{}, err
 	}
 	path := "/plans/" + url.PathEscape(in.PlanID) + "/categories"
 	var wire wireCategoriesResponse

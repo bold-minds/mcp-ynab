@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -30,7 +31,7 @@ func TestCreateTransaction_GateOff(t *testing.T) {
 		t.Error("server should not be called when gate is off")
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: 1000, PayeeName: "X",
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: 1000, PayeeName: "X",
 	})
 	if err == nil || !strings.Contains(err.Error(), "YNAB_ALLOW_WRITES") {
 		t.Errorf("expected YNAB_ALLOW_WRITES error, got %v", err)
@@ -48,25 +49,25 @@ func TestCreateTransaction_HappyPath(t *testing.T) {
 			seenMethod = r.Method
 			_ = json.NewDecoder(r.Body).Decode(&seenBody)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":{"transaction_ids":["txn-42"],"transaction":{
+			_, _ = fmt.Fprintf(w, `{"data":{"transaction_ids":["txn-42"],"transaction":{
 				"id":"txn-42","date":"2026-04-10","amount":-12340,"memo":"Lunch",
-				"cleared":"uncleared","approved":true,"account_id":"acct-1","account_name":"Checking",
+				"cleared":"uncleared","approved":true,"account_id":%q,"account_name":"Checking",
 				"payee_name":"Chipotle","category_name":"Restaurants","deleted":false
-			}}}`))
-		case strings.Contains(r.URL.Path, "/accounts/acct-1") && r.Method == http.MethodGet:
+			}}}`, testAccountID)
+		case strings.Contains(r.URL.Path, "/accounts/"+testAccountID) && r.Method == http.MethodGet:
 			// Post-create balance fetch
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":{"account":{
-				"id":"acct-1","name":"Checking","type":"checking","on_budget":true,"closed":false,
+			_, _ = fmt.Fprintf(w, `{"data":{"account":{
+				"id":%q,"name":"Checking","type":"checking","on_budget":true,"closed":false,
 				"balance":987660,"cleared_balance":987660,"uncleared_balance":0,"deleted":false
-			}}}`))
+			}}}`, testAccountID)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 	})
 	_, out, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID:           "plan-1",
-		AccountID:        "acct-1",
+		PlanID:           testPlanID,
+		AccountID:        testAccountID,
 		AmountMilliunits: -12340,
 		PayeeName:        "Chipotle",
 		Memo:             "Lunch",
@@ -75,7 +76,7 @@ func TestCreateTransaction_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seenMethod != "POST" || seenPath != "/plans/plan-1/transactions" {
+	if seenMethod != "POST" || seenPath != "/plans/"+testPlanID+"/transactions" {
 		t.Errorf("wrong request: %s %s", seenMethod, seenPath)
 	}
 	// Verify body structure
@@ -83,7 +84,7 @@ func TestCreateTransaction_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("request body missing transaction object: %+v", seenBody)
 	}
-	if txn["account_id"] != "acct-1" {
+	if txn["account_id"] != testAccountID {
 		t.Errorf("wrong account_id in body: %v", txn["account_id"])
 	}
 	if txn["amount"].(float64) != -12340 {
@@ -134,7 +135,7 @@ func TestCreateTransaction_DefaultDateIsToday(t *testing.T) {
 		}
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: -100, PayeeName: "X",
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: -100, PayeeName: "X",
 		// Date is deliberately empty
 	})
 	if err != nil {
@@ -153,7 +154,7 @@ func TestCreateTransaction_RequiresPayee(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: 100,
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: 100,
 	})
 	// Assert the full error phrasing, not a weak "payee" substring that
 	// would pass on any unrelated error mentioning "payee". Review nit on
@@ -169,8 +170,8 @@ func TestCreateTransaction_RequiresPlanAndAccount(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	cases := []CreateTransactionInput{
-		{AccountID: "a", AmountMilliunits: 100, PayeeName: "X"},     // missing plan_id
-		{PlanID: "p", AmountMilliunits: 100, PayeeName: "X"},        // missing account_id
+		{AccountID: testAccountID, AmountMilliunits: 100, PayeeName: "X"},     // missing plan_id
+		{PlanID: testPlanID, AmountMilliunits: 100, PayeeName: "X"},        // missing account_id
 	}
 	for _, in := range cases {
 		if _, _, err := client.CreateTransaction(context.Background(), emptyReq(), in); err == nil {
@@ -185,7 +186,7 @@ func TestCreateTransaction_MemoLengthLimit(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: 100, PayeeName: "X",
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: 100, PayeeName: "X",
 		Memo: strings.Repeat("a", 201),
 	})
 	if err == nil || !strings.Contains(err.Error(), "memo must be at most 200 characters") {
@@ -199,7 +200,7 @@ func TestCreateTransaction_AmountBoundRejectedWithoutOverride(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a",
+		PlanID: testPlanID, AccountID: testAccountID,
 		AmountMilliunits: -15_000_000, // $15K outflow
 		PayeeName:        "BigSpend",
 	})
@@ -222,7 +223,7 @@ func TestCreateTransaction_AmountBoundAcceptedWithMatchingOverride(t *testing.T)
 		}
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a",
+		PlanID: testPlanID, AccountID: testAccountID,
 		AmountMilliunits:         -15_000_000,
 		AmountOverrideMilliunits: -15_000_000,
 		PayeeName:                "BigSpend",
@@ -242,7 +243,7 @@ func TestCreateTransaction_InvalidClearedRejected(t *testing.T) {
 		t.Error("server should not be called for invalid cleared")
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: -100, PayeeName: "X",
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: -100, PayeeName: "X",
 		Cleared: "half-cleared",
 	})
 	if err == nil || !strings.Contains(err.Error(), "cleared") {
@@ -258,8 +259,8 @@ func TestCreateTransaction_PayeeIDAndNameMutuallyExclusive(t *testing.T) {
 		t.Error("server should not be called when both payee_id and payee_name set")
 	})
 	_, _, err := client.CreateTransaction(context.Background(), emptyReq(), CreateTransactionInput{
-		PlanID: "p", AccountID: "a", AmountMilliunits: -100,
-		PayeeID: "some-id", PayeeName: "Chipotle",
+		PlanID: testPlanID, AccountID: testAccountID, AmountMilliunits: -100,
+		PayeeID: testPayeeID, PayeeName: "Chipotle",
 	})
 	if err == nil || !strings.Contains(err.Error(), "at most one of payee_id or payee_name may be set") {
 		t.Errorf("expected mutex error, got %v", err)
@@ -274,7 +275,7 @@ func TestUpdateCategoryBudgeted_GateOff(t *testing.T) {
 		t.Error("server should not be called when gate is off")
 	})
 	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
-		PlanID: "p", Month: "current", CategoryID: "c", NewBudgetedMilliunits: 400000,
+		PlanID: testPlanID, Month: "current", CategoryID: testCategoryID, NewBudgetedMilliunits: 400000,
 	})
 	if err == nil || !strings.Contains(err.Error(), "YNAB_ALLOW_WRITES") {
 		t.Errorf("expected gate error, got %v", err)
@@ -308,7 +309,7 @@ func TestUpdateCategoryBudgeted_HappyPathReturnsBeforeAndAfter(t *testing.T) {
 		}
 	})
 	_, out, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
-		PlanID: "plan-1", Month: "current", CategoryID: "cat-1",
+		PlanID: testPlanID, Month: "current", CategoryID: testCategoryID,
 		NewBudgetedMilliunits: 500000,
 	})
 	if err != nil {
@@ -320,7 +321,7 @@ func TestUpdateCategoryBudgeted_HappyPathReturnsBeforeAndAfter(t *testing.T) {
 	if len(seenPaths) != 2 {
 		t.Fatalf("expected 2 requests (GET then PATCH), got %d: %v", len(seenPaths), seenPaths)
 	}
-	const wantMonthPath = "/plans/plan-1/months/2027-05-01/categories/cat-1"
+	wantMonthPath := "/plans/" + testPlanID + "/months/2027-05-01/categories/" + testCategoryID
 	if seenPaths[0] != "GET "+wantMonthPath {
 		t.Errorf("first request wrong: %s", seenPaths[0])
 	}
@@ -346,9 +347,9 @@ func TestUpdateCategoryBudgeted_RequiresFields(t *testing.T) {
 		name string
 		in   UpdateCategoryBudgetedInput
 	}{
-		{"missing plan_id", UpdateCategoryBudgetedInput{Month: "current", CategoryID: "c"}},
-		{"missing category_id", UpdateCategoryBudgetedInput{PlanID: "p", Month: "current"}},
-		{"missing month", UpdateCategoryBudgetedInput{PlanID: "p", CategoryID: "c"}},
+		{"missing plan_id", UpdateCategoryBudgetedInput{Month: "current", CategoryID: testCategoryID}},
+		{"missing category_id", UpdateCategoryBudgetedInput{PlanID: testPlanID, Month: "current"}},
+		{"missing month", UpdateCategoryBudgetedInput{PlanID: testPlanID, CategoryID: testCategoryID}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -378,7 +379,7 @@ func TestUpdateCategoryBudgeted_AmountBound(t *testing.T) {
 		}}}`))
 	})
 	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
-		PlanID: "p", Month: "current", CategoryID: "c",
+		PlanID: testPlanID, Month: "current", CategoryID: testCategoryID,
 		NewBudgetedMilliunits: 15_000_000, // $15K delta from 0, over cap
 	})
 	if err == nil || !strings.Contains(err.Error(), "amount_override_milliunits") {
@@ -410,7 +411,7 @@ func TestUpdateCategoryBudgeted_AmountBoundGuardsDelta(t *testing.T) {
 		}}}`))
 	})
 	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
-		PlanID: "p", Month: "current", CategoryID: "c",
+		PlanID: testPlanID, Month: "current", CategoryID: testCategoryID,
 		NewBudgetedMilliunits: 1_000_000, // $1K new, but delta is -$50K
 	})
 	if err == nil || !strings.Contains(err.Error(), "amount_override_milliunits") {
@@ -443,7 +444,7 @@ func TestUpdateCategoryBudgeted_SmallDeltaPassesCap(t *testing.T) {
 		}}}`))
 	})
 	_, _, err := client.UpdateCategoryBudgeted(context.Background(), emptyReq(), UpdateCategoryBudgetedInput{
-		PlanID: "p", Month: "current", CategoryID: "c",
+		PlanID: testPlanID, Month: "current", CategoryID: testCategoryID,
 		NewBudgetedMilliunits: 50_001_000,
 	})
 	if err != nil {
@@ -463,7 +464,7 @@ func TestUpdateTransaction_GateOff(t *testing.T) {
 	})
 	memo := "new memo"
 	_, _, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
-		PlanID: "p", TransactionID: "t", Memo: &memo,
+		PlanID: testPlanID, TransactionID: testTransactionID, Memo: &memo,
 	})
 	if err == nil || !strings.Contains(err.Error(), "YNAB_ALLOW_WRITES") {
 		t.Errorf("expected gate error, got %v", err)
@@ -476,7 +477,7 @@ func TestUpdateTransaction_RequiresAtLeastOneMutableField(t *testing.T) {
 		t.Error("server should not be called")
 	})
 	_, _, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
-		PlanID: "p", TransactionID: "t",
+		PlanID: testPlanID, TransactionID: testTransactionID,
 	})
 	if err == nil || !strings.Contains(err.Error(), "at least one field") {
 		t.Errorf("expected no-op error, got %v", err)
@@ -527,7 +528,7 @@ func TestUpdateTransaction_HappyPathSingleField(t *testing.T) {
 	})
 	newMemo := "new memo"
 	_, out, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
-		PlanID: "plan-1", TransactionID: "t1", Memo: &newMemo,
+		PlanID: testPlanID, TransactionID: testTransactionID, Memo: &newMemo,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -590,7 +591,7 @@ func TestUpdateTransaction_PUTBodyOmitsUntouchedFields(t *testing.T) {
 	})
 	newMemo := "new memo"
 	if _, _, err := client.UpdateTransaction(context.Background(), emptyReq(), UpdateTransactionInput{
-		PlanID: "plan-1", TransactionID: "t1", Memo: &newMemo,
+		PlanID: testPlanID, TransactionID: testTransactionID, Memo: &newMemo,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -631,10 +632,10 @@ func TestUpdateTransaction_LengthAndEnumValidation(t *testing.T) {
 		in   UpdateTransactionInput
 		want string
 	}{
-		{"payee_name > 200", UpdateTransactionInput{PlanID: "p", TransactionID: "t", PayeeName: &tooLong}, "200"},
-		{"memo > 500", UpdateTransactionInput{PlanID: "p", TransactionID: "t", Memo: &tooLongMemo}, "500"},
-		{"bad cleared", UpdateTransactionInput{PlanID: "p", TransactionID: "t", Cleared: &badCleared}, "cleared"},
-		{"bad flag", UpdateTransactionInput{PlanID: "p", TransactionID: "t", FlagColor: &badFlag}, "flag_color"},
+		{"payee_name > 200", UpdateTransactionInput{PlanID: testPlanID, TransactionID: testTransactionID, PayeeName: &tooLong}, "200"},
+		{"memo > 500", UpdateTransactionInput{PlanID: testPlanID, TransactionID: testTransactionID, Memo: &tooLongMemo}, "500"},
+		{"bad cleared", UpdateTransactionInput{PlanID: testPlanID, TransactionID: testTransactionID, Cleared: &badCleared}, "cleared"},
+		{"bad flag", UpdateTransactionInput{PlanID: testPlanID, TransactionID: testTransactionID, FlagColor: &badFlag}, "flag_color"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -672,7 +673,7 @@ func TestApproveTransaction_HappyPathNoElicit(t *testing.T) {
 		}
 	})
 	_, out, err := client.ApproveTransaction(context.Background(), emptyReq(), ApproveTransactionInput{
-		PlanID: "plan-1", TransactionID: "t1",
+		PlanID: testPlanID, TransactionID: testTransactionID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -710,7 +711,7 @@ func TestApproveTransaction_GateOff(t *testing.T) {
 		t.Error("server should not be called when gate is off")
 	})
 	_, _, err := client.ApproveTransaction(context.Background(), emptyReq(), ApproveTransactionInput{
-		PlanID: "p", TransactionID: "t",
+		PlanID: testPlanID, TransactionID: testTransactionID,
 	})
 	if err == nil || !strings.Contains(err.Error(), "YNAB_ALLOW_WRITES") {
 		t.Errorf("expected gate error, got %v", err)
