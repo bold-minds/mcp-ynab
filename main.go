@@ -68,7 +68,7 @@ func main() {
 			printUsage()
 			return
 		default:
-			log.Printf("unknown subcommand: %q", args[0])
+			log.Printf("unknown subcommand: %q", args[0]) // #nosec G706 -- %q escapes the value; no injection risk
 			printUsage()
 			os.Exit(2)
 		}

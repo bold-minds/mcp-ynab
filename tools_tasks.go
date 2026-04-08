@@ -570,7 +570,7 @@ func countUnapprovedExcludingTransferMirrors(txns []Transaction) int {
 // years and this name has not changed, so the pragmatic choice is a
 // string match with a documented assumption. If YNAB ever localizes,
 // this is the single place to update.
-const ynabStatusCreditCardPaymentGroupName = "Credit Card Payments"
+const ynabStatusCreditCardPaymentGroupName = "Credit Card Payments" // #nosec G101 -- not a credential; YNAB API category group display name
 
 // debtAccountTypes is the set of YNAB account types that represent
 // liabilities (money the user owes). Used by both ynab_status and

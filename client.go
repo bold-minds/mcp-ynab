@@ -88,7 +88,7 @@ func loadToken() (Token, error) {
 	}
 	if path := os.Getenv("YNAB_API_TOKEN_FILE"); path != "" {
 		// Bounded read — see maxTokenFileBytes doc. Review finding M5.
-		f, err := os.Open(path)
+		f, err := os.Open(path) // #nosec G304,G703 -- path is from trusted env var YNAB_API_TOKEN_FILE, not user input
 		if err != nil {
 			return Token{}, fmt.Errorf("read YNAB_API_TOKEN_FILE: %w", err)
 		}
@@ -129,8 +129,8 @@ func loadToken() (Token, error) {
 		)
 	}
 	return Token{}, fmt.Errorf(
-		"keyring unavailable: %w. Set YNAB_API_TOKEN or YNAB_API_TOKEN_FILE "+
-			"as an environment-variable fallback, or fix the keyring and retry",
+		"keyring unavailable: %w. Set YNAB_API_TOKEN, YNAB_API_TOKEN_FILE, "+
+			"or run 'mcp-ynab store-token' as a fallback, or fix the keyring and retry",
 		err,
 	)
 }
@@ -363,7 +363,7 @@ func logAndRefuseRedirect(req *http.Request, _ []*http.Request) error {
 		if len(raw) > maxLogURL {
 			raw = raw[:maxLogURL] + "…(truncated)"
 		}
-		log.Printf("ynab: refused redirect to %q (all redirects blocked to prevent Authorization forwarding)", sanitize(raw))
+		log.Printf("ynab: refused redirect to %q (all redirects blocked to prevent Authorization forwarding)", sanitize(raw)) // #nosec G706 -- sanitize() + %q escapes the value
 	}
 	return http.ErrUseLastResponse
 }

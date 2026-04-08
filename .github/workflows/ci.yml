@@ -118,7 +118,7 @@ jobs:
           check-latest: true
       - name: Install gosec
         # TODO: pin by SHA once we confirm the exact upstream commit for
-        # v2.21.4; leaving the pinned tag in place for now matches the
+        # v2.25.0; leaving the pinned tag in place for now matches the
         # govulncheck step above. Review finding on missing gosec step.
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.25.0
       - run: gosec -quiet ./...
