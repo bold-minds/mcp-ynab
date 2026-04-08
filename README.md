@@ -7,6 +7,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/bold-minds/mcp-ynab)](https://goreportcard.com/report/github.com/bold-minds/mcp-ynab)
 [![Release](https://img.shields.io/github/v/release/bold-minds/mcp-ynab?include_prereleases&sort=semver)](https://github.com/bold-minds/mcp-ynab/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![SafeSkill 92/100](https://img.shields.io/badge/SafeSkill-92%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/bold-minds-mcp-ynab)
 
 A **read-only by default** Model Context Protocol server for the [YNAB](https://www.ynab.com) budgeting API. Lets an LLM (Claude Desktop, Cursor, Claude Code, or any MCP-compatible client) inspect your plans, accounts, categories, transactions, and monthly summaries. Write tools (create/update/approve transactions, update category budgeted) are available **only when** `YNAB_ALLOW_WRITES=1` is set in the environment — when unset, writes are not registered at startup and cannot be invoked.
 
