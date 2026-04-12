@@ -1,33 +1,8 @@
 # CODEOWNERS for bold-minds/mcp-ynab
 #
-# When a PR modifies a file, GitHub will auto-request a review from the
-# listed owners. Path patterns are evaluated in order, and the LAST matching
-# pattern wins — so the general owner line stays at the top and the more
-# specific security-sensitive rules come after.
-#
-# Replace the placeholder owners below with your actual GitHub username or
-# team before enabling branch protection that requires code-owner review.
+# GitHub auto-requests a review from the listed owner on every PR that
+# changes a matching path. The org-level @bold-minds owner covers all
+# members; add path-scoped overrides below if specific files ever need
+# narrower review.
 
-# Default owner for everything in the repo.
-* @bold-minds/maintainers
-
-# Security-critical paths — these files touch the credential handling path
-# or the outbound HTTP path. Any change requires explicit security review.
-/token.go             @bold-minds/maintainers @bold-minds/security
-/client.go            @bold-minds/maintainers @bold-minds/security
-/errors.go            @bold-minds/maintainers @bold-minds/security
-/main.go              @bold-minds/maintainers @bold-minds/security
-
-# CI and release infrastructure — supply-chain risk, requires maintainer review.
-/.github/             @bold-minds/maintainers
-/Dockerfile           @bold-minds/maintainers
-/.goreleaser.yaml     @bold-minds/maintainers
-/go.mod               @bold-minds/maintainers
-/go.sum               @bold-minds/maintainers
-
-# Documentation can land with a single maintainer review.
-/README.md            @bold-minds/maintainers
-/SECURITY.md          @bold-minds/maintainers @bold-minds/security
-/CHANGELOG.md         @bold-minds/maintainers
-/CONTRIBUTING.md      @bold-minds/maintainers
-/CODE_OF_CONDUCT.md   @bold-minds/maintainers
+* @bold-minds
